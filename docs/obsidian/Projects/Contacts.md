@@ -1,128 +1,169 @@
 ---
 title: Contacts
-aliases: [VIP List, Contact Database, People]
-tags: [projects, contacts, vip, people]
+aliases: [VIP List, Contact Resolution, People]
+tags: [projects, contacts, vip, people, resolution]
 created: 2026-03-31
 ---
 
 # Contacts
 
-OpenClaw maintains a contact database for identifying message senders, routing communications to projects, and determining escalation priority. Contacts are stored in the [[PostgreSQL]] `contacts` table.
+Contacts are people Bryson interacts with across all communication channels. The contact system enables sender identification, VIP routing, and cross-channel resolution.
 
-## VIP Contacts
+## VIP List
 
-VIP contacts always trigger **Tier 4 (Urgent)** escalation regardless of message content or intent classification. See [[Escalation System]].
+VIP contacts always trigger at minimum Tier 4 (Immediate Push) in the [[Escalation System]], regardless of message content or intent classification.
 
-| Name | Relationship | Projects | Channels | Why VIP |
+| Name | Type | Relationship | Projects | Why VIP |
 |---|---|---|---|---|
-| Mike | Business partner | Search Tuners | Gmail, iMessage, Telegram | Revenue partner, joint business decisions |
-| Daniel | Key contact | Multiple | Gmail, iMessage | High-priority business relationship |
-| Steven | Key contact | Multiple | Gmail, iMessage | High-priority business relationship |
-| Hunter | Key contact | Multiple | Gmail, iMessage | High-priority business relationship |
+| **Mike** | Partner | Search Tuners business partner | [[Project Registry#Search Tuners\|Search Tuners]] | Revenue-critical partnership. Frequent communication. |
+| **Daniel** (Daniel Sanchez) | Client | TTT primary contact | [[Project Registry#Texas Tree Tops (TTT)\|TTT]] | Active client, frequent communicator, key revenue. |
+| **Steven** | VIP | Key business contact | Multiple | Business-critical relationship. |
+| **Hunter** | VIP | Key business contact | Multiple | Business-critical relationship. |
+| **Raymond** | VIP | Key business contact | Multiple | Business-critical relationship. |
+| **Bren** | VIP | Key business contact | Multiple | Business-critical relationship. |
 
-VIP status is stored as `is_vip = true` in the contacts table. The [[Inbox Agent]] checks this flag on every incoming message.
+VIP status is stored as `is_vip = true` in the [[PostgreSQL]] `contacts` table.
+
+### Adding/Removing VIPs
+
+VIP status is managed by updating the `contacts` table directly or via the [[Orchestrator]] when Bryson instructs a contact status change. Future: Telegram command to toggle VIP status.
 
 ## Contact Types
 
-| Type | Description | Escalation Behavior |
+| Type | Description | Examples |
 |---|---|---|
-| `client` | Paying client or client representative | Tier 3 for action items, Tier 2 for FYI |
-| `partner` | Business partner (e.g., Mike) | Usually VIP, Tier 4 |
-| `vendor` | Service provider or tool vendor | Tier 2 unless urgent |
-| `personal` | Friends, family | Tier 1 unless flagged urgent |
-| `lead` | Prospective client | Tier 2, tracked in GHL |
+| `client` | Paying client or client contact | Daniel Sanchez (TTT), Salon Esby owner |
+| `partner` | Business partner with shared revenue/ownership | Mike (Search Tuners) |
+| `vendor` | Service provider or tool provider | SaaS vendors, contractors |
+| `personal` | Personal contact, not business | Family, friends |
+| `lead` | Prospective client, not yet converted | Inbound inquiries |
 
-## Contact Resolution Across Channels
+Contact type is stored in the `contacts.type` column and influences notification behavior. `client` and `partner` types receive higher baseline escalation priority than `vendor` or `personal`.
 
-A single person may contact Bryson through multiple channels. OpenClaw resolves contacts by matching against known identifiers:
+## Cross-Channel Resolution
 
-### Resolution Priority
+A single person may contact Bryson through multiple channels (email, iMessage, Telegram). The contact system resolves these to a single contact record.
+
+### Resolution Order
+
+When a message arrives, the [[Inbox Agent]] attempts to match the sender:
 
 ```
-Incoming message → Extract sender identifier
-        │
-        ▼
-  Channel-specific lookup:
-    Gmail    → Match contacts.email
-    iMessage → Match contacts.phone OR contacts.imessage_handle
-    Telegram → Match contacts.telegram_username
-        │
-        ▼
-  Match found?
-    ├── YES → Load full contact record, project associations, VIP status
-    └── NO  → Create provisional contact record
-              Log for Bryson's review in daily briefing
+Gmail message arrives
+    |
+    v
+Match by email address
+    SELECT * FROM contacts WHERE email = $1
+    +-- Found --> Use this contact record
+    +-- Not found --> Continue
+
+iMessage arrives
+    |
+    v
+Match by phone number OR iMessage handle
+    SELECT * FROM contacts WHERE phone = $1 OR imessage_handle = $1
+    +-- Found --> Use this contact record
+    +-- Not found --> Continue
+
+Telegram message arrives
+    |
+    v
+Match by Telegram username
+    SELECT * FROM contacts WHERE telegram_username = $1
+    +-- Found --> Use this contact record
+    +-- Not found --> Continue
+
+No match found
+    |
+    v
+Create provisional contact record with available identifiers
+Log as "new contact" for Bryson's review
 ```
 
-### Cross-Channel Identity
+### Multi-Channel Identity
 
-| Contact Field | Channel | Example |
+A fully resolved contact has identifiers for every channel:
+
+| Field | Channel | Example |
 |---|---|---|
-| `email` | Gmail | `mike@searchtuners.com` |
-| `phone` | iMessage | `+15551234567` |
-| `imessage_handle` | iMessage | `mike@icloud.com` |
-| `telegram_username` | Telegram | `@mike_st` |
+| `email` | Gmail | `daniel@texastreetops.com` |
+| `phone` | iMessage (phone) | `+15551234567` |
+| `imessage_handle` | iMessage (Apple ID) | `daniel@icloud.com` |
+| `telegram_username` | Telegram | `@danielsanchez` |
 
-A single contact can have all four identifiers set, allowing unified tracking across all channels.
+When the Inbox Agent matches a sender on one channel, it has access to the full contact record including identifiers for other channels. This enables:
 
-### Project Association
+- "Last time Daniel emailed about X" when Daniel messages via iMessage
+- "Daniel's recent Telegram conversation about TTT" when processing a Gmail thread from Daniel
 
-Contacts can be associated with multiple projects via the `project_ids` UUID array:
+### Provisional Contacts
 
-```sql
--- Find all contacts for a project
-SELECT * FROM contacts WHERE $1 = ANY(project_ids);
+When a sender cannot be matched to an existing contact:
 
--- Find all projects for a contact
-SELECT p.* FROM projects p WHERE p.id = ANY(
-  SELECT unnest(project_ids) FROM contacts WHERE id = $1
-);
-```
+1. A new contact record is created with the available identifier (email, phone, or Telegram username)
+2. Contact type is set to `null` (unclassified)
+3. VIP status defaults to `false`
+4. The event appears in the daily briefing as "New contact from [channel]"
+5. Bryson can classify the contact via Telegram or directly in the database
 
-## Contact Schema
+## Contact Data Schema
 
-See [[PostgreSQL#contacts]] for the full table schema.
+Contacts are stored in the [[PostgreSQL]] `contacts` table:
 
 | Column | Type | Purpose |
 |---|---|---|
 | `id` | UUID | Primary key |
 | `name` | TEXT | Display name |
 | `email` | TEXT | Gmail matching |
-| `phone` | TEXT | iMessage phone matching |
-| `imessage_handle` | TEXT | iMessage Apple ID matching |
+| `phone` | TEXT | iMessage matching (phone number) |
+| `imessage_handle` | TEXT | iMessage matching (Apple ID) |
 | `telegram_username` | TEXT | Telegram matching |
-| `type` | TEXT | Contact type (client, partner, vendor, personal, lead) |
-| `project_ids` | UUID[] | Associated projects |
-| `is_vip` | BOOLEAN | VIP flag for escalation |
-| `last_contact` | TIMESTAMPTZ | Last communication timestamp |
-| `notes` | TEXT | Free-form context notes |
+| `type` | TEXT | `client`, `partner`, `vendor`, `personal`, `lead` |
+| `project_ids` | UUID[] | Array of associated project UUIDs |
+| `is_vip` | BOOLEAN | VIP status for escalation routing |
+| `last_contact` | TIMESTAMPTZ | When Bryson last communicated with them |
+| `notes` | TEXT | Free-form notes about this contact |
 
-## Adding New Contacts
+See [[PostgreSQL]] for full schema details including indexes.
 
-Contacts are added in several ways:
+### Key Indexes
 
-1. **Database seed** -- Initial contacts loaded via `npm run db:seed`
-2. **Auto-created** -- When the [[Inbox Agent]] encounters an unknown sender, a provisional record is created
-3. **GHL sync** -- Contacts from [[GoHighLevel Integration]] are synced via [[n8n Workflows]]
-4. **Manual** -- Bryson can add contacts via Telegram command or direct database entry
+- **`idx_contacts_is_vip`** -- Partial index on VIP contacts for fast lookup
+- **`idx_contacts_email`** -- Partial index for email matching
+- **`idx_contacts_phone`** -- Partial index for phone matching
 
-Auto-created contacts have `type = NULL` and `is_vip = false` by default. They appear in the daily briefing for Bryson to categorize.
+## Contact-Project Association
 
-## Usage By Agents
+Each contact can be associated with one or more projects via the `project_ids` array. This association enables:
 
-| Agent | How Contacts Are Used |
-|---|---|
-| [[Inbox Agent]] | Sender identification, VIP check, project routing |
-| [[Scheduler Agent]] | Calendar attendee lookup for pre-briefs |
-| [[Research Agent]] | Contact context when researching a project |
-| [[Reporting Agent]] | VIP activity summary in daily briefing |
-| [[Orchestrator]] | Project context enrichment |
-| [[Escalation System]] | VIP escalation tier override |
+- **Inbox Agent:** "This email from Daniel is about TTT" (because Daniel is associated with TTT)
+- **Scheduler Agent:** "This meeting with Daniel needs TTT context" (attendee lookup)
+- **Reporting Agent:** "Daniel's open tasks for TTT" (contact-project join)
+
+## API Access
+
+Contacts are available via the REST API:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `GET /api/contacts` | GET | List all contacts |
+| `GET /api/contacts?vip=true` | GET | List VIP contacts only |
+
+See [[API Reference]] for full endpoint documentation.
+
+## Code References
+
+- Contact repository: `src/db/repositories/contacts.ts`
+- VIP lookup: `getVIPs()` method
+- Contact route: `src/server/routes/contacts.ts`
+- Sender identification: `src/agents/inbox/index.ts`
 
 ## Related Pages
 
-- [[Escalation System]] for VIP escalation behavior
+- [[Escalation System]] for how VIP status affects escalation tiers
+- [[Notification Logic]] for VIP detection rules
 - [[Inbox Agent]] for sender identification flow
-- [[PostgreSQL]] for table schema
-- [[Project Registry]] for project associations
 - [[Scheduler Agent]] for attendee lookup
+- [[Project Registry]] for project associations
+- [[PostgreSQL]] for the `contacts` table schema
+- [[API Reference]] for contact endpoints
