@@ -1,131 +1,171 @@
 ---
 title: Project Registry
-aliases: [Projects, Project List, Client Registry]
+aliases: [Projects, Project List, Active Projects]
 tags: [projects, registry, clients, businesses]
 created: 2026-03-31
 ---
 
 # Project Registry
 
-Bryson runs three interconnected businesses as a solo operator. This page documents every project tracked by OpenClaw, including status, priority, key contacts, and context.
+Bryson manages 8 active projects across three interconnected businesses. Every agent in OpenClaw uses this registry to match incoming data to the correct project context. The registry is stored in the [[PostgreSQL]] `projects` table and cached in [[Redis]] by the [[Orchestrator]].
 
 ## Businesses
 
-### Helium Solutions
+Bryson operates three businesses:
 
-Bryson's AI marketing automation agency. The parent company for most client work.
+| Business | Role | Primary Focus |
+|---|---|---|
+| **SWRE (SW Recovery Services)** | Owner/Operator | Debt recovery services |
+| **Helium Solutions** | Owner | Technology consulting and development |
+| **OnTrack Marketing** | Owner/Partner | Digital marketing agency |
 
-### Search Tuners
-
-A referral-based marketing partnership with Mike. Joint venture focused on SEO and digital marketing services.
-
-### OnTrack Marketing
-
-A SaaS product in development. Bryson's long-term product play.
-
-## Project Table
-
-| Project | Business | Client | Priority | Status | Description |
-|---|---|---|---|---|---|
-| SWRE | Helium Solutions | SWRE | 1 | Active | AI-powered knowledge base with 822K+ Qdrant vectors. OpenClaw has read-only access to SWRE's Qdrant. See [[Qdrant]]. |
-| Texas Tree Tops (TTT) | Helium Solutions | Texas Tree Tops | 2 | Active | Arborist company in Austin, TX. Marketing automation and lead generation. |
-| Helium Solutions | Helium Solutions | -- | 2 | Active | Agency operations, internal processes, and meta-work (including building OpenClaw). |
-| OnTrack Marketing | OnTrack | -- | 2 | Active | SaaS product development. Marketing automation platform. |
-| Search Tuners | Search Tuners | -- | 2 | Active | Partnership with Mike. SEO and referral-based marketing. Joint lead tracking. |
-| Salon Esby | Helium Solutions | Salon Esby | 3 | Active | Salon client. Appointment booking and marketing. Uses [[GoHighLevel Integration]] for CRM. |
-| A to Z Bail Bonds | Helium Solutions | A to Z Bail Bonds | 3 | Active | Bail bonds company. FDCPA/TCPA compliance required for all communications. See [[Security]]. |
-| THS Home Solar | Helium Solutions | THS Home Solar | 3 | Active | Solar panel company. Lead generation and marketing automation. |
-
-## Project Details
+## Active Projects
 
 ### SWRE
 
-- **Priority:** 1 (highest)
-- **Client:** SWRE
-- **Key tech:** Qdrant vector database (822K+ vectors), Node.js/TypeScript
-- **OpenClaw integration:** Read-only access to SWRE's Qdrant instance for cross-referencing
-- **Key contacts:** (managed in [[Contacts]])
-- **Notes:** OpenClaw's codebase shares architectural patterns with SWRE. The [[Research Agent]] can query SWRE's knowledge base for relevant information.
+| Field | Value |
+|---|---|
+| **Project Name** | SWRE |
+| **Full Name** | SW Recovery Services |
+| **Priority** | 1 (highest) |
+| **Status** | Active |
+| **Client** | SW Recovery Services (Bryson's company) |
+| **Known Abbreviations** | SWRE, SW Recovery, SWR |
+| **Key Contacts** | Internal team |
+| **Notes** | Primary revenue source. Has existing Qdrant instance with 822K+ vectors. OpenClaw has read-only access to SWRE data. FDCPA/TCPA compliance required -- no debtor PII in OpenClaw databases. See [[Security]]. |
+| **GHL Sub-Account** | SW Recovery Services location |
 
 ### Texas Tree Tops (TTT)
 
-- **Priority:** 2
-- **Client:** Texas Tree Tops (Austin, TX arborist company)
-- **Services:** Marketing automation, lead generation, competitive analysis
-- **Key contacts:** (managed in [[Contacts]])
-- **Notes:** Active client with regular communication. The [[Research Agent]] handles competitor research for TTT.
+| Field | Value |
+|---|---|
+| **Project Name** | Texas Tree Tops |
+| **Priority** | 2 |
+| **Status** | Active |
+| **Client** | Daniel Sanchez |
+| **Known Abbreviations** | TTT, Tree Tops, Texas Trees |
+| **Key Contacts** | Daniel Sanchez (VIP) |
+| **Notes** | Arborist/tree service business. Daniel is a frequent communicator and VIP contact. |
 
-### Helium Solutions (Internal)
+### Helium Solutions
 
-- **Priority:** 2
-- **Description:** Agency operations, new client onboarding, process improvement
-- **Notes:** OpenClaw itself is a Helium Solutions project. Internal tasks and agency-wide initiatives are tracked here.
+| Field | Value |
+|---|---|
+| **Project Name** | Helium Solutions |
+| **Priority** | 1 (highest) |
+| **Status** | Active |
+| **Client** | Helium Solutions (Bryson's company) |
+| **Known Abbreviations** | Helium, HS |
+| **Key Contacts** | Internal |
+| **Notes** | Technology consulting business. OpenClaw itself is a Helium Solutions project. |
 
 ### OnTrack Marketing
 
-- **Priority:** 2
-- **Description:** SaaS product for marketing automation
-- **Status:** In development
-- **Notes:** Long-term product play. Development tasks and feature planning tracked as OpenClaw tasks.
+| Field | Value |
+|---|---|
+| **Project Name** | OnTrack Marketing |
+| **Priority** | 2 |
+| **Status** | Active |
+| **Client** | OnTrack Marketing (Bryson's company) |
+| **Known Abbreviations** | OnTrack, OTM, On Track |
+| **Key Contacts** | Internal + client roster |
+| **Notes** | Digital marketing agency. Manages campaigns and leads for clients. |
 
 ### Search Tuners
 
-- **Priority:** 2
-- **Partner:** Mike (VIP contact)
-- **Description:** Referral-based marketing partnership
-- **CRM:** Shared GHL sub-account with Mike
-- **Notes:** Mike is a VIP contact -- all messages from Mike trigger immediate escalation. See [[Contacts]].
+| Field | Value |
+|---|---|
+| **Project Name** | Search Tuners |
+| **Priority** | 2 |
+| **Status** | Active |
+| **Client** | Partnership |
+| **Partner** | Mike (VIP) |
+| **Known Abbreviations** | Search Tuners, ST |
+| **Key Contacts** | Mike (VIP, business partner) |
+| **Notes** | SEO/search marketing partnership with Mike. Revenue-sharing arrangement. Mike is VIP -- all communications trigger immediate escalation. |
 
 ### Salon Esby
 
-- **Priority:** 3
-- **Client:** Salon Esby
-- **Services:** Appointment booking, marketing automation
-- **CRM:** Dedicated GHL sub-account
-- **Notes:** Moderate-touch client. Regular appointment and campaign management.
+| Field | Value |
+|---|---|
+| **Project Name** | Salon Esby |
+| **Priority** | 3 |
+| **Status** | Active |
+| **Client** | Salon Esby |
+| **Known Abbreviations** | Salon, Esby |
+| **Key Contacts** | Salon owner |
+| **Notes** | Salon/beauty business client. Lower priority but active project. |
 
 ### A to Z Bail Bonds
 
-- **Priority:** 3
-- **Client:** A to Z Bail Bonds
-- **Services:** CRM management, lead tracking, marketing
-- **Compliance:** FDCPA and TCPA regulations apply. See [[Security]].
-- **CRM:** Dedicated GHL sub-account
-- **Notes:** All outbound communications must go through approval. No automated messaging to bail bonds contacts.
+| Field | Value |
+|---|---|
+| **Project Name** | A to Z Bail Bonds |
+| **Priority** | 3 |
+| **Status** | Active |
+| **Client** | A to Z Bail Bonds |
+| **Known Abbreviations** | A to Z, Bail Bonds, AtoZ, A2Z |
+| **Key Contacts** | Business owner |
+| **Notes** | Bail bonds business. Regulated industry -- TCPA compliance applies to any automated outreach. See [[Security]]. |
 
 ### THS Home Solar
 
-- **Priority:** 3
-- **Client:** THS Home Solar
-- **Services:** Lead generation, marketing automation
-- **Notes:** Solar industry marketing. Seasonal demand patterns.
+| Field | Value |
+|---|---|
+| **Project Name** | THS Home Solar |
+| **Priority** | 3 |
+| **Status** | Active |
+| **Client** | THS Home Solar |
+| **Known Abbreviations** | THS, Home Solar, Solar |
+| **Key Contacts** | Business owner |
+| **Notes** | Residential solar installation business. |
 
 ## Priority Scale
 
-| Priority | Meaning | Response Time |
+| Priority | Meaning | Notification Behavior |
 |---|---|---|
-| 1 | Critical business impact | Same day |
-| 2 | Important, revenue-generating | Within 24 hours |
-| 3 | Active but lower urgency | Within 48 hours |
-| 4 | Maintenance / low activity | Best effort |
-| 5 | Archived / paused | No active monitoring |
+| **1** | Critical business operations | Items always surface in briefing; overdue tasks trigger immediate escalation |
+| **2** | Active client work | Items surface in briefing; overdue tasks included in daily report |
+| **3** | Maintenance / lower activity | Items batched; only escalated if explicitly urgent |
 
-## Project Context in OpenClaw
+## Project Matching
 
-The project registry is loaded into the [[Orchestrator]]'s Project Context Store on every invocation. This means every agent has access to:
+The [[Ingestion Agent]] uses Fuse.js fuzzy matching to resolve handwritten project references against this registry. The matching considers:
 
-- Project names and aliases (for fuzzy matching in [[Ingestion Agent]])
-- Priority levels (for [[Reporting Agent]] scoring)
-- Associated contacts (for [[Inbox Agent]] routing)
-- Compliance flags (for [[Security]] checks)
+- `name` field (project name)
+- `client` field (client name)
+- Known abbreviations (stored in `metadata` JSONB column)
 
-Project data is stored in the [[PostgreSQL]] `projects` table and cached in [[Redis]] (`cache:project_context`, TTL 1 hour).
+Match threshold: 0.4 (Fuse.js score). Matches below threshold are flagged as ambiguous and sent to Bryson for clarification.
+
+| Written in Notebook | Matched To | Confidence |
+|---|---|---|
+| "TTT" | Texas Tree Tops | High (0.95) |
+| "SWRE" | SWRE | Exact (1.0) |
+| "ontrack" | OnTrack Marketing | High (0.88) |
+| "helium" | Helium Solutions | High (0.92) |
+| "bail bonds" | A to Z Bail Bonds | Medium (0.85) |
+| "solar" | THS Home Solar | Medium (0.80) |
+| "the thing Mike" | Search Tuners | Low -- needs clarification |
+
+## PostgreSQL Schema
+
+Projects are stored in the `projects` table. See [[PostgreSQL]] for the full schema.
+
+Key fields: `name`, `client`, `status`, `priority`, `metadata` (JSONB for abbreviations, URLs, tech stack notes).
+
+## Code References
+
+- Project repository: `src/db/repositories/projects.ts`
+- Fuzzy matching: Fuse.js in `src/agents/ingestion/index.ts`
+- Context caching: [[Redis]] `cache:project_context`
 
 ## Related Pages
 
-- [[Contacts]] for key people per project
-- [[PostgreSQL]] for the projects table schema
 - [[Orchestrator]] for project context loading
 - [[Ingestion Agent]] for fuzzy project matching
-- [[GoHighLevel Integration]] for CRM sub-account mapping
-- [[Security]] for compliance flags
+- [[Contacts]] for project-associated contacts
+- [[Reporting Agent]] for project snapshots in daily briefing
+- [[PostgreSQL]] for the `projects` table schema
+- [[GoHighLevel Integration]] for project-to-GHL mapping
+- [[Security]] for SWRE compliance requirements
