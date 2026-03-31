@@ -1,294 +1,272 @@
 ---
 title: Testing Strategy
-aliases: [Testing, Tests, QA]
+aliases: [Testing, Tests, Test Plan]
 tags: [development, testing, vitest, quality]
 created: 2026-03-31
 ---
 
 # Testing Strategy
 
-OpenClaw uses Vitest as its test runner. This page documents how to test each component, mocking strategies for external APIs, and the testing pyramid.
+OpenClaw uses Vitest for all testing. Tests are organized by agent and component, with a focus on unit tests for agent logic and integration tests for end-to-end flows.
 
 ## Test Runner
 
-- **Framework:** Vitest 3.0
-- **Config:** Default Vitest configuration (auto-discovers `*.test.ts` files)
-- **Commands:**
-  - `npm test` -- Run all tests once
-  - `npm run test:watch` -- Watch mode for development
+| Tool | Version | Configuration |
+|---|---|---|
+| Vitest | 3.0+ | TypeScript-native, ESM support, watch mode |
 
-## Testing Pyramid
+### Commands
 
-```
-        ┌───────────┐
-        │   E2E     │  Few: full pipeline tests
-        │  Tests    │  (ingestion, inbox flow)
-        ├───────────┤
-        │Integration│  Some: database queries,
-        │  Tests    │  API endpoints, Redis ops
-        ├───────────┤
-        │   Unit    │  Many: agent logic, scoring,
-        │  Tests    │  fuzzy matching, formatting
-        └───────────┘
-```
+| Command | Description |
+|---|---|
+| `npm test` | Run all tests once (`vitest run`) |
+| `npm run test:watch` | Run tests in watch mode (`vitest`) |
 
-## Unit Testing
+### Configuration
 
-### Agent Logic
-
-Each agent's core logic should be testable without external dependencies.
-
-**[[Orchestrator]]:**
-- Event routing: given an event type, verify it routes to the correct agent
-- Project context matching: given an event, verify the correct project is matched
-- Deduplication: verify duplicate events are rejected
-
-**[[Ingestion Agent]]:**
-- Structuring pass: given Claude Vision output (mocked), verify correct parsing into tasks/notes/decisions/questions
-- Fuzzy matching: given a list of projects and a handwritten reference, verify Fuse.js matches correctly
-- Chunking: given a text string, verify correct 512-token chunks with 50-token overlap
+Vitest is configured in `vitest.config.ts` or the `test` section of `package.json`:
 
 ```typescript
-describe('fuzzyProjectMatch', () => {
-  const projects = [
-    { name: 'SWRE' },
-    { name: 'Texas Tree Tops' },
-    { name: 'OnTrack Marketing' },
-  ];
+// vitest.config.ts
+import { defineConfig } from 'vitest/config';
 
-  it('matches exact abbreviation', () => {
-    expect(matchProject('TTT', projects)).toBe('Texas Tree Tops');
-  });
-
-  it('matches fuzzy input', () => {
-    expect(matchProject('on track', projects)).toBe('OnTrack Marketing');
-  });
-
-  it('returns null for no match', () => {
-    expect(matchProject('xyz unknown', projects)).toBeNull();
-  });
+export default defineConfig({
+  test: {
+    globals: true,
+    environment: 'node',
+    include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'html'],
+    },
+    testTimeout: 30000, // 30s for API call tests
+  },
 });
 ```
 
-**[[Inbox Agent]]:**
-- Intent classification: given mocked Claude output, verify routing logic
-- VIP detection: given a contact with `is_vip = true`, verify Tier 4 escalation
-- Draft generation: verify draft format includes required context
+## Test Categories
 
-**[[Reporting Agent]]:**
-- Priority scoring: verify the scoring algorithm produces correct order
-- Briefing formatting: verify the template renders correctly with sample data
+### Unit Tests
 
-**[[Scheduler Agent]]:**
-- Conflict detection: given overlapping events, verify conflict is flagged
-- Pre-brief timing: verify pre-brief sends 15 minutes before event
+Test individual functions and modules in isolation. External dependencies (databases, APIs) are mocked.
 
-### Utility Functions
+| Component | What to Test | Location |
+|---|---|---|
+| Config validation | Zod schema accepts valid env, rejects invalid | `src/config/__tests__/` |
+| Repositories | CRUD operations, query builders | `src/db/repositories/__tests__/` |
+| Ingestion structuring | Claude response parsing, Zod validation | `src/agents/ingestion/__tests__/` |
+| Fuzzy matching | Fuse.js project matching accuracy | `src/agents/ingestion/__tests__/` |
+| Intent classification | Correct intent for different message types | `src/agents/inbox/__tests__/` |
+| VIP detection | VIP contacts trigger correct tier | `src/agents/inbox/__tests__/` |
+| Priority scoring | Score calculation for different factors | `src/agents/reporting/__tests__/` |
+| MarkdownV2 escaping | Special characters escaped correctly | `src/telegram/__tests__/` |
+| Auth middleware | Valid/invalid tokens, skip paths | `src/server/middleware/__tests__/` |
 
-- Zod schema validation for all input types
-- Redis key pattern generation
-- MarkdownV2 escaping for Telegram
-- Token counting with tiktoken
+### Integration Tests
 
-## Integration Testing
+Test flows that span multiple components, using real Docker services.
 
-### Database Tests
+| Flow | Services Required | What to Test |
+|---|---|---|
+| Ingestion pipeline | PostgreSQL, Qdrant, Redis | Photo in, notes + tasks + vectors out |
+| Inbox triage | PostgreSQL, Redis | Message in, intent classified, stored correctly |
+| Escalation lifecycle | PostgreSQL, Redis | Create, queue, deliver, action, update |
+| Research flow | PostgreSQL, Qdrant | Query in, multi-source search, synthesis out |
+| Briefing generation | PostgreSQL | Query all tables, format output |
+| API endpoints | PostgreSQL | Request/response for all routes |
 
-Test actual database queries against a test PostgreSQL instance.
+### End-to-End Tests
 
-```typescript
-describe('projects repository', () => {
-  beforeAll(async () => {
-    // Run migrations on test database
-    await migrate(testPool);
-  });
+Test the complete system from external input to Telegram output. These require all services and potentially mocked external APIs.
 
-  afterEach(async () => {
-    // Clean up test data
-    await testPool.query('DELETE FROM projects');
-  });
-
-  it('creates and retrieves a project', async () => {
-    const project = await create({ name: 'Test Project' });
-    const found = await getById(project.id);
-    expect(found?.name).toBe('Test Project');
-  });
-
-  it('filters active projects', async () => {
-    await create({ name: 'Active', status: 'active' });
-    await create({ name: 'Archived', status: 'archived' });
-    const active = await getActive();
-    expect(active).toHaveLength(1);
-  });
-});
-```
-
-### Redis Tests
-
-Test Redis operations against a test Redis instance.
-
-```typescript
-describe('webhook deduplication', () => {
-  it('allows first message through', async () => {
-    const isNew = await checkDedup('gmail', 'msg_123');
-    expect(isNew).toBe(true);
-  });
-
-  it('blocks duplicate message', async () => {
-    await checkDedup('gmail', 'msg_123');
-    const isNew = await checkDedup('gmail', 'msg_123');
-    expect(isNew).toBe(false);
-  });
-});
-```
-
-### Qdrant Tests
-
-Test vector operations against a test Qdrant instance.
-
-```typescript
-describe('qdrant collections', () => {
-  it('initializes all collections', async () => {
-    await initCollections();
-    const collections = await qdrant.getCollections();
-    expect(collections.collections.map(c => c.name))
-      .toContain('bryson_notes');
-  });
-});
-```
-
-### API Endpoint Tests
-
-Test Express routes with supertest.
-
-```typescript
-describe('health endpoint', () => {
-  it('returns 200 when healthy', async () => {
-    const res = await request(app).get('/health');
-    expect(res.status).toBe(200);
-  });
-});
-```
+| Scenario | Description |
+|---|---|
+| Photo to briefing | Upload photo, verify tasks appear in next briefing |
+| VIP email to escalation | Simulate Gmail thread from VIP, verify Telegram escalation |
+| Calendar conflict | Simulate overlapping events, verify conflict escalation |
+| Full briefing cycle | Populate test data, trigger briefing, verify all sections |
 
 ## Mocking External APIs
 
-### Anthropic Claude
+External APIs should never be called in tests. Each service has a mock:
 
-Mock the Anthropic SDK to return predetermined responses:
+### Claude (Anthropic)
 
 ```typescript
+// Mock the Anthropic SDK
 vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    messages: {
+  default: class MockAnthropic {
+    messages = {
       create: vi.fn().mockResolvedValue({
-        content: [{ type: 'text', text: JSON.stringify(mockResponse) }],
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            tasks: [{ title: 'Test task', project_ref: 'SWRE' }],
+            notes: [{ content: 'Test note' }],
+            decisions: [],
+            questions: [],
+          }),
+        }],
       }),
-    },
-  })),
-}));
-```
-
-### OpenAI Embeddings
-
-```typescript
-vi.mock('openai', () => ({
-  default: vi.fn().mockImplementation(() => ({
-    embeddings: {
-      create: vi.fn().mockResolvedValue({
-        data: [{ embedding: new Array(1536).fill(0.1) }],
-      }),
-    },
-  })),
+    };
+  },
 }));
 ```
 
 ### Gmail API
 
 ```typescript
-const mockGmail = {
-  users: {
-    threads: {
-      list: vi.fn().mockResolvedValue({ data: { threads: [] } }),
-      get: vi.fn().mockResolvedValue({ data: mockThread }),
+// Mock googleapis Gmail client
+vi.mock('googleapis', () => ({
+  google: {
+    auth: {
+      OAuth2: vi.fn().mockReturnValue({
+        setCredentials: vi.fn(),
+        on: vi.fn(),
+      }),
     },
-    drafts: {
-      create: vi.fn().mockResolvedValue({ data: { id: 'draft_123' } }),
-    },
+    gmail: vi.fn().mockReturnValue({
+      users: {
+        threads: {
+          list: vi.fn().mockResolvedValue({ data: { threads: [] } }),
+          get: vi.fn().mockResolvedValue({ data: { messages: [] } }),
+        },
+        drafts: {
+          create: vi.fn().mockResolvedValue({ data: { id: 'draft_123' } }),
+        },
+      },
+    }),
   },
-};
+}));
 ```
 
 ### Telegram (Telegraf)
 
 ```typescript
-const mockCtx = {
-  chat: { id: 12345 },
-  message: { text: '/brief' },
-  reply: vi.fn(),
-  replyWithMarkdownV2: vi.fn(),
-};
+// Mock Telegraf context for command tests
+function createMockContext(overrides = {}) {
+  return {
+    chat: { id: 12345 },
+    message: { text: '/brief' },
+    reply: vi.fn().mockResolvedValue({ message_id: 1 }),
+    answerCbQuery: vi.fn().mockResolvedValue(true),
+    editMessageReplyMarkup: vi.fn().mockResolvedValue(true),
+    telegram: {
+      getFileLink: vi.fn().mockResolvedValue(new URL('https://example.com/photo.jpg')),
+      sendMessage: vi.fn().mockResolvedValue({ message_id: 2 }),
+    },
+    ...overrides,
+  };
+}
 ```
 
-## End-to-End Tests
+### iMessage Bridge
 
-Full pipeline tests that verify data flows from input to output:
+```typescript
+// Mock HTTP calls to the bridge
+vi.mock('node-fetch', () => ({
+  default: vi.fn().mockResolvedValue({
+    ok: true,
+    json: () => Promise.resolve({
+      messages: [
+        { id: 'msg_1', sender: '+15551234567', text: 'Test message', timestamp: '2026-03-31T10:00:00Z' },
+      ],
+    }),
+  }),
+}));
+```
 
-### Ingestion Pipeline E2E
+### OpenAI Embeddings
 
-1. Mock Claude Vision response with known notebook content
-2. Process through ingestion pipeline
-3. Verify notes and tasks in PostgreSQL
-4. Verify vectors in Qdrant
-5. Verify Telegram confirmation message
+```typescript
+// Mock OpenAI embedding generation
+vi.mock('openai', () => ({
+  default: class MockOpenAI {
+    embeddings = {
+      create: vi.fn().mockResolvedValue({
+        data: [{ embedding: new Array(1536).fill(0.01) }],
+      }),
+    };
+  },
+}));
+```
 
-### Inbox Pipeline E2E
+## Test Data Seeding
 
-1. Mock Gmail thread with known content
-2. Process through Inbox Agent
-3. Verify contact lookup occurred
-4. Verify intent classification
-5. Verify draft creation (if applicable)
-6. Verify inbox_events record in PostgreSQL
+The seed script (`npm run db:seed`) populates the database with realistic test data:
 
-## Test Environment
+### Projects
 
-### Environment Variables
+All 8 projects from [[Project Registry]] are seeded with correct priorities, clients, and metadata.
 
-Tests use `NODE_ENV=test` which:
-- Skips production-required variable checks
-- Uses test database connection strings
-- Disables external API calls (relies on mocks)
+### Contacts
 
-### Docker Services
+VIP contacts (Mike, Daniel, Steven, Hunter, Raymond, Bren) are seeded with `is_vip = true` and realistic channel identifiers.
 
-Integration tests require running Docker services:
+### Tasks
+
+Sample tasks across projects with varying statuses, priorities, and due dates (including some overdue).
+
+### Notes
+
+Sample ingested notebook entries with structured JSON.
+
+### Inbox Events
+
+Sample messages from different channels with different intents.
+
+### Escalations
+
+A few pending escalations for testing the escalation UI.
+
+## Docker Test Environment
+
+Integration tests use the same Docker Compose services as development:
 
 ```bash
-# Start test infrastructure
-docker-compose up -d postgres redis qdrant
+# Start test databases
+docker compose up -d
 
 # Run tests
 npm test
+
+# Run with coverage
+npx vitest run --coverage
 ```
 
-### Test Database
+For CI environments, tests can use `docker compose` to spin up services before running:
 
-Tests should use a separate database (e.g., `openclaw_test`) to avoid polluting development data.
+```bash
+docker compose up -d --wait
+npm run db:migrate
+npm run db:seed
+npm test
+docker compose down
+```
 
-## Coverage Goals
+## Test File Naming Convention
 
-| Layer | Target Coverage |
+| Pattern | Type |
 |---|---|
-| Agent logic (unit) | 80%+ |
-| Repositories (integration) | 90%+ |
-| API endpoints (integration) | 80%+ |
-| Full pipelines (E2E) | Key flows only |
+| `*.test.ts` | Unit or integration test |
+| `*.spec.ts` | Alternative (both patterns supported) |
+
+Tests are co-located with source files or in `__tests__/` subdirectories.
+
+## Coverage Targets
+
+| Component | Target | Rationale |
+|---|---|---|
+| Config/validation | 95%+ | Critical path, must not fail |
+| Repositories | 80%+ | Database operations are straightforward |
+| Agent logic | 70%+ | Agent reasoning depends on LLM output, which is mocked |
+| API routes | 80%+ | Request/response validation |
+| Telegram bot | 60%+ | UI layer, harder to test comprehensively |
 
 ## Related Pages
 
-- [[Build Phases]] for when each test is implemented
+- [[Build Phases]] for when tests are written
 - [[Tech Stack]] for Vitest details
-- [[Orchestrator]] for routing tests
+- [[API Reference]] for endpoint testing
 - [[Ingestion Agent]] for ingestion pipeline tests
-- [[Inbox Agent]] for inbox pipeline tests
-- [[Reporting Agent]] for scoring algorithm tests
+- [[Inbox Agent]] for triage logic tests
