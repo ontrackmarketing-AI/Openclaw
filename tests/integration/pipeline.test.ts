@@ -1,9 +1,29 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import Anthropic from '@anthropic-ai/sdk';
-import OpenAI from 'openai';
 
 // ---------------------------------------------------------------------------
-// Mocks
+// Mocks — Anthropic and OpenAI at module scope so clearAllMocks doesn't break them
+// ---------------------------------------------------------------------------
+
+const mockAnthropicCreate = vi.fn().mockResolvedValue({
+  content: [{ type: 'text', text: '{}' }],
+});
+vi.mock('@anthropic-ai/sdk', () => ({
+  default: vi.fn().mockImplementation(() => ({
+    messages: { create: mockAnthropicCreate },
+  })),
+}));
+
+const mockOpenAIEmbeddingsCreate = vi.fn().mockResolvedValue({
+  data: [{ embedding: new Array(1536).fill(0.1), index: 0 }],
+});
+vi.mock('openai', () => ({
+  default: vi.fn().mockImplementation(() => ({
+    embeddings: { create: mockOpenAIEmbeddingsCreate },
+  })),
+}));
+
+// ---------------------------------------------------------------------------
+// Mocks — Repositories
 // ---------------------------------------------------------------------------
 
 const mockProjectsGetAll = vi.fn();
@@ -146,28 +166,15 @@ const testProjects = [
 
 describe('Full Ingestion Pipeline', () => {
   let agent: IngestionAgent;
-  let anthropicCreate: ReturnType<typeof vi.fn>;
-  let openaiEmbeddingsCreate: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.clearAllMocks();
     agent = new IngestionAgent();
-
-    // Wire up mocked Anthropic Vision API
-    const anthropicInstance = (Anthropic as unknown as ReturnType<typeof vi.fn>).mock
-      .results.at(-1)?.value;
-    anthropicCreate = anthropicInstance?.messages?.create;
-
-    // Wire up mocked OpenAI embeddings API
-    const openaiInstance = (OpenAI as unknown as ReturnType<typeof vi.fn>).mock.results.at(
-      -1,
-    )?.value;
-    openaiEmbeddingsCreate = openaiInstance?.embeddings?.create;
   });
 
   it('processes an image through the entire pipeline: Vision -> extraction -> matching -> DB -> Qdrant -> confirmation', async () => {
     // Step 1: Vision API returns structured extraction
-    anthropicCreate.mockResolvedValueOnce({
+    mockAnthropicCreate.mockResolvedValueOnce({
       content: [{ type: 'text', text: JSON.stringify(sampleExtraction) }],
     });
 
@@ -205,7 +212,7 @@ describe('Full Ingestion Pipeline', () => {
     });
 
     // Step 5: OpenAI embeddings
-    openaiEmbeddingsCreate.mockResolvedValue({
+    mockOpenAIEmbeddingsCreate.mockResolvedValue({
       data: [{ embedding: new Array(1536).fill(0.01), index: 0 }],
     });
 
@@ -220,8 +227,8 @@ describe('Full Ingestion Pipeline', () => {
     // ------- Assertions -------
 
     // Vision API was called
-    expect(anthropicCreate).toHaveBeenCalledTimes(1);
-    expect(anthropicCreate).toHaveBeenCalledWith(
+    expect(mockAnthropicCreate).toHaveBeenCalledTimes(1);
+    expect(mockAnthropicCreate).toHaveBeenCalledWith(
       expect.objectContaining({
         messages: expect.arrayContaining([
           expect.objectContaining({
@@ -270,7 +277,7 @@ describe('Full Ingestion Pipeline', () => {
     );
 
     // Embeddings were created
-    expect(openaiEmbeddingsCreate).toHaveBeenCalledWith(
+    expect(mockOpenAIEmbeddingsCreate).toHaveBeenCalledWith(
       expect.objectContaining({
         model: 'text-embedding-3-small',
         input: expect.any(Array),
@@ -316,7 +323,7 @@ describe('Full Ingestion Pipeline', () => {
 
   it('handles Vision API failure gracefully and preserves raw text', async () => {
     // Vision returns unparseable output
-    anthropicCreate.mockResolvedValueOnce({
+    mockAnthropicCreate.mockResolvedValueOnce({
       content: [
         {
           type: 'text',
@@ -337,7 +344,7 @@ describe('Full Ingestion Pipeline', () => {
       created_at: new Date(),
     });
 
-    openaiEmbeddingsCreate.mockResolvedValue({
+    mockOpenAIEmbeddingsCreate.mockResolvedValue({
       data: [{ embedding: new Array(1536).fill(0), index: 0 }],
     });
 
@@ -377,7 +384,7 @@ describe('Full Ingestion Pipeline', () => {
       ],
     };
 
-    anthropicCreate.mockResolvedValueOnce({
+    mockAnthropicCreate.mockResolvedValueOnce({
       content: [{ type: 'text', text: JSON.stringify(extractionWithUnknown) }],
     });
 
@@ -391,7 +398,7 @@ describe('Full Ingestion Pipeline', () => {
       created_at: new Date(),
     });
 
-    openaiEmbeddingsCreate.mockResolvedValue({
+    mockOpenAIEmbeddingsCreate.mockResolvedValue({
       data: [{ embedding: new Array(1536).fill(0), index: 0 }],
     });
 
@@ -401,33 +408,11 @@ describe('Full Ingestion Pipeline', () => {
     // TTT should match, UNKNOWN should not
     expect(result.matchedProjects.some((m) => m.ref === 'TTT')).toBe(true);
     expect(result.unmatchedRefs).toContain('UNKNOWN_CLIENT_XYZ');
-
-    // The process entry point should return partial status
-    const agentResult = await agent.process({
-      type: 'notebook_image',
-      data: {
-        imageBase64: imageBuffer.toString('base64'),
-        source: 'telegram',
-      },
-    });
-
-    // Reset mocks for the second call through process()
-    anthropicCreate.mockResolvedValueOnce({
-      content: [{ type: 'text', text: JSON.stringify(extractionWithUnknown) }],
-    });
-    mockProjectsGetAll.mockResolvedValue(testProjects);
-    mockNotesCreate.mockResolvedValue({
-      id: 'note-partial-002',
-      project_id: 'proj-ttt',
-      source: 'telegram',
-      raw_text: extractionWithUnknown.raw_text,
-      structured: extractionWithUnknown,
-      created_at: new Date(),
-    });
+    expect(result.taskCount).toBe(2);
   });
 
   it('processes a PNG image with correct media type detection', async () => {
-    anthropicCreate.mockResolvedValueOnce({
+    mockAnthropicCreate.mockResolvedValueOnce({
       content: [{ type: 'text', text: JSON.stringify(sampleExtraction) }],
     });
 
@@ -441,7 +426,7 @@ describe('Full Ingestion Pipeline', () => {
       created_at: new Date(),
     });
 
-    openaiEmbeddingsCreate.mockResolvedValue({
+    mockOpenAIEmbeddingsCreate.mockResolvedValue({
       data: [{ embedding: new Array(1536).fill(0), index: 0 }],
     });
 
@@ -450,7 +435,7 @@ describe('Full Ingestion Pipeline', () => {
     const result = await agent.processImage(pngBuffer, 'telegram');
 
     // Verify the Vision API was called with PNG media type
-    expect(anthropicCreate).toHaveBeenCalledWith(
+    expect(mockAnthropicCreate).toHaveBeenCalledWith(
       expect.objectContaining({
         messages: expect.arrayContaining([
           expect.objectContaining({
@@ -467,6 +452,6 @@ describe('Full Ingestion Pipeline', () => {
     );
 
     expect(result.noteId).toBe('note-png-001');
-    expect(result.taskCount).toBe(3);
+    expect(result.taskCount).toBe(sampleExtraction.tasks.length);
   });
 });

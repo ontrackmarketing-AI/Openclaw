@@ -1,187 +1,218 @@
 ---
 title: Deployment
-aliases: [Infrastructure, Hosting, Docker, AWS]
+aliases: [Deploy, Infrastructure, Hosting]
 tags: [operations, deployment, docker, aws, infrastructure]
 created: 2026-03-31
 ---
 
 # Deployment
 
-OpenClaw runs on AWS EC2 with Docker Compose for service orchestration. A Mac mini provides iMessage bridge capabilities.
+OpenClaw runs on a minimal infrastructure stack: Docker Compose for services, AWS EC2 for the main server, and a Mac mini for iMessage. Total cost target: $90-130/month.
 
-## Docker Compose Setup
+## Architecture Overview
 
-All core services run via Docker Compose. See `docker-compose.yml` in the project root.
-
-### Services
-
-| Service | Image | Container Name | Ports |
-|---|---|---|---|
-| PostgreSQL | `postgres:16-alpine` | `openclaw-postgres` | 5432:5432 |
-| Redis | `redis:7-alpine` | `openclaw-redis` | 6379:6379 |
-| Qdrant | `qdrant/qdrant:latest` | `openclaw-qdrant` | 6333:6333, 6334:6334 |
-
-### Volumes
-
-| Volume | Purpose |
-|---|---|
-| `pgdata` | PostgreSQL data persistence |
-| `redisdata` | Redis data persistence (queue recovery) |
-| `qdrantdata` | Qdrant vector storage persistence |
-
-### Health Checks
-
-All services have Docker health checks:
-
-| Service | Check | Interval | Retries |
-|---|---|---|---|
-| PostgreSQL | `pg_isready -U openclaw -d openclaw` | 10s | 5 |
-| Redis | `redis-cli ping` | 10s | 5 |
-| Qdrant | `curl -f http://localhost:6333/healthz` | 10s | 5 |
-
-### Starting Services
-
-```bash
-# Start all infrastructure services
-docker-compose up -d
-
-# Check health
-docker-compose ps
-
-# View logs
-docker-compose logs -f postgres
-docker-compose logs -f redis
-docker-compose logs -f qdrant
+```
++-----------------------------+          Tailscale          +-------------------+
+|  AWS EC2 (t3.medium)        | <------------------------> |  Mac mini          |
+|  us-east-1 or us-west-2     |                            |  (Bryson's office) |
+|                              |                            |                    |
+|  Docker Compose:             |                            |  iMessage Bridge   |
+|    openclaw-app (Node.js)    |                            |  (Node.js server)  |
+|    openclaw-postgres (PG 16) |                            |  Messages.app      |
+|    openclaw-redis (Redis 7)  |                            +-------------------+
+|    openclaw-qdrant (Qdrant)  |
+|                              |
+|  n8n (self-hosted)           |
++-----------------------------+
 ```
 
-## Application Deployment
+## Local Development (Docker Compose)
 
-The OpenClaw Node.js application runs outside Docker (directly on the host or in a separate container):
+The `docker-compose.yml` at the project root provides all three database services:
 
-```bash
-# Install dependencies
-npm install
+```yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: openclaw-postgres
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
 
-# Build TypeScript
-npm run build
+  redis:
+    image: redis:7-alpine
+    container_name: openclaw-redis
+    ports: ["6379:6379"]
+    volumes: [redisdata:/data]
 
-# Run migrations
-npm run db:migrate
-
-# Seed initial data
-npm run db:seed
-
-# Start production server
-npm start
-
-# Or development with watch mode
-npm run dev
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: openclaw-qdrant
+    ports: ["6333:6333", "6334:6334"]
+    volumes: [qdrantdata:/qdrant/storage]
 ```
 
-## AWS EC2 Specifications
+### Local Development Steps
 
-### Recommended Instance
+1. `docker compose up -d` -- Start databases
+2. `cp .env.example .env` -- Create environment file
+3. Fill in required values (at minimum: `DATABASE_URL`, `REDIS_URL`, `QDRANT_URL`)
+4. `npm install` -- Install dependencies
+5. `npm run db:migrate` -- Run database migrations
+6. `npm run db:seed` -- Seed initial data (projects, contacts)
+7. `npm run dev` -- Start the app with watch mode (`tsx watch src/index.ts`)
 
-| Spec | Value | Rationale |
+The app runs on `http://localhost:3000` by default. Telegram bot runs in polling mode during development.
+
+## Production (AWS EC2)
+
+### Instance Specification
+
+| Component | Specification | Rationale |
 |---|---|---|
-| Instance type | `t3.medium` | 2 vCPU, 4 GB RAM -- sufficient for all services |
-| Storage | 50 GB gp3 EBS | PostgreSQL, Qdrant vectors, Redis persistence, application code |
-| Region | `us-east-1` | Closest to Bryson (Texas), good API latency |
-| OS | Ubuntu 22.04 LTS | Stable, well-supported, Docker-friendly |
+| **Instance type** | `t3.medium` | 2 vCPU, 4 GB RAM. Sufficient for Node.js app + 3 Docker containers. Burstable for ingestion spikes. |
+| **Storage** | 30 GB gp3 EBS | OS + Docker images + database volumes. gp3 for consistent IOPS. |
+| **Region** | `us-east-1` or `us-west-2` | Low latency to Google APIs and Telegram servers |
+| **OS** | Ubuntu 22.04 LTS | Stable, well-supported, Docker-friendly |
 
-### Cost Breakdown (Estimated Monthly)
+### PostgreSQL Option
 
-| Item | Cost |
-|---|---|
-| EC2 t3.medium (on-demand) | ~$30/month |
-| EBS 50 GB gp3 | ~$4/month |
-| Data transfer (estimate) | ~$5/month |
-| **EC2 Total** | **~$39/month** |
+Two configurations are supported:
 
-### API Costs (Estimated Monthly)
-
-| Service | Estimated Usage | Cost |
+| Option | When | Cost |
 |---|---|---|
-| Anthropic Claude (reasoning) | ~500K tokens/day | ~$15/month |
-| OpenAI embeddings | ~100K tokens/day | ~$1/month |
-| Tavily search | ~50 queries/day | ~$5/month |
-| **API Total** | | **~$21/month** |
+| **Same EC2 (Docker)** | Phase 1-4, low data volume | $0 additional |
+| **RDS t3.micro** | Phase 5+, when data reliability is critical | ~$15/month |
 
-### Total Estimated Monthly Cost
+Starting with PostgreSQL in Docker on the same EC2 instance is recommended. Migrate to RDS when the system is stable and data volume warrants it.
 
-| Category | Cost |
-|---|---|
-| AWS infrastructure | ~$39 |
-| API services | ~$21 |
-| Tailscale | Free (personal plan) |
-| n8n (self-hosted) | Free |
-| **Total** | **~$60/month** |
+### Production Setup Steps
 
-## Mac Mini Requirements
+1. Launch EC2 instance with Ubuntu 22.04
+2. Install Docker and Docker Compose
+3. Install Tailscale and join the tailnet
+4. Clone the repository
+5. Configure `.env` with production secrets
+6. `docker compose up -d` -- Start databases
+7. `npm run db:migrate` -- Run migrations
+8. `npm run build` -- Compile TypeScript
+9. `npm start` -- Start production server (or use PM2/systemd)
+10. Configure Telegram webhook URL
+11. Set up n8n instance
 
-See [[iMessage Bridge]] for detailed setup.
+### Process Management
+
+In production, the Node.js process should be managed by `systemd` or PM2:
+
+```ini
+# /etc/systemd/system/openclaw.service
+[Unit]
+Description=OpenClaw Personal OS
+After=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/openclaw
+ExecStart=/usr/bin/node dist/index.js
+Restart=on-failure
+RestartSec=10
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## Mac Mini (iMessage Bridge)
+
+The Mac mini runs the [[iMessage Bridge]] server. See that page for detailed setup.
 
 | Requirement | Details |
 |---|---|
-| Hardware | Mac mini (M1 or later recommended) |
-| macOS | Ventura 13.0+ |
-| Network | Ethernet, Tailscale installed |
-| Power | Always on, 24/7 |
-| Software | Node.js 20+, iMessage bridge server |
-| Apple ID | Signed in to Messages.app |
-| Startup | Bridge configured as launchd Launch Agent |
+| Hardware | Mac mini (M1+ recommended) |
+| Location | Bryson's office or home, always on |
+| Network | Wired ethernet, Tailscale installed |
+| Software | Node.js 20+, Messages.app signed in |
+| Startup | Bridge configured as macOS Launch Agent |
+| Cost | ~$0/month (existing hardware, home internet) |
 
-**Cost:** One-time ~$599 (Mac mini M2) + ~$5/month electricity.
+### Launch Agent Configuration
 
-## Production Checklist
-
-### Before First Deploy
-
-- [ ] EC2 instance launched with Ubuntu 22.04
-- [ ] Docker and Docker Compose installed
-- [ ] Node.js 20+ installed
-- [ ] Tailscale installed and joined to tailnet
-- [ ] `.env` file configured with all production secrets
-- [ ] `docker-compose up -d` -- all services healthy
-- [ ] `npm run db:migrate` -- schema applied
-- [ ] `npm run db:seed` -- initial project and contact data loaded
-- [ ] Telegram bot created via @BotFather, token configured
-- [ ] Google OAuth2 flow completed, refresh token obtained
-- [ ] n8n deployed and workflows configured
-
-### Mac Mini Setup
-
-- [ ] Mac mini powered on and connected to network
-- [ ] Tailscale installed and joined to same tailnet
-- [ ] Messages.app signed in with Bryson's Apple ID
-- [ ] iMessage bridge server installed and running
-- [ ] Launch Agent configured for auto-start
-- [ ] Test message sent successfully from EC2 to Mac mini
-
-### Post-Deploy Verification
-
-- [ ] `curl http://localhost:3000/health` returns 200
-- [ ] Telegram `/status` command returns system health
-- [ ] Test photo upload processes through ingestion pipeline
-- [ ] Test Gmail fetch processes through inbox pipeline
-- [ ] Daily briefing triggers at configured time
-
-## Process Management
-
-In production, use PM2 or systemd to keep the application running:
-
-```bash
-# Using PM2
-npm install -g pm2
-pm2 start dist/index.js --name openclaw
-pm2 save
-pm2 startup
+```xml
+<!-- ~/Library/LaunchAgents/com.openclaw.imessage-bridge.plist -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openclaw.imessage-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/Users/bryson/imessage-bridge/index.js</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
 ```
+
+## Tailscale Networking
+
+All machines are connected via Tailscale mesh VPN:
+
+| Machine | Tailscale IP | Services Exposed |
+|---|---|---|
+| AWS EC2 | `100.x.x.x` | OpenClaw API (port 3000) |
+| Mac mini | `100.y.y.y` | iMessage Bridge (port 4000) |
+| SWRE server | `100.z.z.z` | Qdrant (port 6333, read-only) |
+
+No services are exposed to the public internet except:
+- EC2 port 443 (for Telegram webhook, behind reverse proxy)
+- EC2 port 80 (redirect to 443)
+
+See [[Security]] for Tailscale security details.
+
+## Cost Breakdown
+
+| Component | Monthly Cost | Notes |
+|---|---|---|
+| AWS EC2 t3.medium | ~$30 | On-demand pricing. Reserved instance: ~$19/month |
+| EBS 30 GB gp3 | ~$2.40 | Storage for OS + Docker volumes |
+| Data transfer | ~$5-10 | Outbound to APIs, Telegram, etc. |
+| Anthropic API (Claude) | ~$20-40 | Depends on ingestion volume and triage complexity |
+| OpenAI API (embeddings) | ~$5-10 | text-embedding-3-small is very cheap |
+| Tavily API | ~$0-10 | Free tier covers light research; paid for heavy use |
+| Tailscale | $0 | Free for personal use (up to 100 devices) |
+| Mac mini | $0 | Existing hardware + home internet |
+| n8n | $0 | Self-hosted |
+| **Total** | **~$62-102** | |
+
+With RDS t3.micro add ~$15/month. With reserved EC2 pricing, total can be under $90/month.
+
+## Why Not Serverless
+
+See [[Decision Log#Why Not Serverless]]. Key reasons:
+
+1. **Long-running processes** -- BullMQ workers, Telegram bot polling, and cron jobs need persistent processes
+2. **Cold starts** -- Agent reasoning with Claude takes 5-15 seconds; adding Lambda cold starts would make it worse
+3. **State management** -- Redis connections, Qdrant connections, and in-memory caches would be lost between invocations
+4. **Complexity** -- A single EC2 instance with Docker Compose is simpler to debug than a Lambda + SQS + DynamoDB architecture
+5. **Cost** -- At OpenClaw's usage level, EC2 is cheaper than equivalent Lambda invocations
+
+## Monitoring
+
+| What | Tool | Details |
+|---|---|---|
+| Application logs | Winston (JSON to stdout) | Structured logging with levels |
+| Container health | Docker healthchecks | PostgreSQL, Redis, Qdrant all have healthchecks |
+| Uptime | `/health` endpoint | Returns `200 OK` with uptime |
+| System metrics | Telegram `/status` command | On-demand system health |
+| Errors | Telegram alerts | Critical errors trigger Tier 5 escalation |
 
 ## Related Pages
 
-- [[Tech Stack]] for technology choices
-- [[iMessage Bridge]] for Mac mini details
-- [[Security]] for production secret management
-- [[Environment Variables]] for all configuration
-- [[Docker Compose]] reference in `docker-compose.yml`
+- [[Security]] for network and access security
+- [[iMessage Bridge]] for Mac mini setup details
+- [[Environment Variables]] for production configuration
+- [[Tech Stack]] for software dependencies
+- [[Decision Log#Why Not Serverless]] for architecture reasoning

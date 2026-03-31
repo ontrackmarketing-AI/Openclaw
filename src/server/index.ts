@@ -105,7 +105,7 @@ export async function startServer(): Promise<void> {
   });
 }
 
-export function getServerInstance() {
+export function getServerInstance(): import("node:http").Server | null {
   return serverInstance;
 }
 
