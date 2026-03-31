@@ -1,9 +1,11 @@
+import { google, calendar_v3 } from "googleapis";
 import { BaseAgent, AgentEvent, AgentResult } from "../base.js";
+import { config } from "../../config/index.js";
 import { logger } from "../../config/logger.js";
 import * as projectsRepo from "../../db/repositories/projects.js";
 import * as tasksRepo from "../../db/repositories/tasks.js";
-import * as notesRepo from "../../db/repositories/notes.js";
 import * as contactsRepo from "../../db/repositories/contacts.js";
+import * as notesRepo from "../../db/repositories/notes.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -12,36 +14,61 @@ import * as contactsRepo from "../../db/repositories/contacts.js";
 export interface CalendarEvent {
   id: string;
   summary: string;
-  description: string | null;
-  start: string; // ISO datetime
+  start: string;
   end: string;
-  location: string | null;
-  attendees: { email: string; displayName?: string; responseStatus?: string }[];
-  organizer: { email: string; displayName?: string };
-  htmlLink: string;
+  attendees: string[];
+  description: string;
+  location: string;
 }
 
-interface Conflict {
-  event1: CalendarEvent;
-  event2: CalendarEvent;
+export interface ConflictPair {
+  eventA: CalendarEvent;
+  eventB: CalendarEvent;
   overlapMinutes: number;
 }
 
-interface TimeBlockSuggestion {
+export interface TimeBlockSuggestion {
   start: string;
   end: string;
-  durationMinutes: number;
   type: "deep_work" | "admin" | "break";
   reason: string;
 }
 
-interface PreBrief {
+export interface PreBrief {
   event: CalendarEvent;
-  contactInfo: contactsRepo.Contact | null;
-  projectContext: string | null;
-  recentNotes: string[];
-  openTasks: string[];
-  suggestedPrep: string;
+  attendeeDetails: Array<{
+    name: string;
+    email: string;
+    type: string | null;
+    isVip: boolean;
+    notes: string | null;
+  }>;
+  relatedProjects: Array<{
+    id: string;
+    name: string;
+    status: string;
+  }>;
+  openTasks: Array<{
+    id: string;
+    title: string;
+    priority: number;
+    dueDate: string | null;
+  }>;
+  recentNotes: Array<{
+    id: string;
+    snippet: string;
+    createdAt: Date;
+  }>;
+  briefingSummary: string;
+}
+
+export interface DailyScheduleSummary {
+  date: string;
+  events: CalendarEvent[];
+  conflicts: ConflictPair[];
+  suggestedBlocks: TimeBlockSuggestion[];
+  totalMeetingHours: number;
+  freeHours: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -54,38 +81,49 @@ export class SchedulerAgent extends BaseAgent {
   }
 
   // -----------------------------------------------------------------------
-  // Fetch upcoming events from Google Calendar
+  // Google Calendar client
   // -----------------------------------------------------------------------
 
   /**
-   * Fetch events from Google Calendar for the next N hours.
+   * Create a Google Calendar API client using OAuth2 credentials from config
+   * (client_id, client_secret, refresh_token).
+   */
+  getCalendarClient(): calendar_v3.Calendar {
+    const { clientId, clientSecret, refreshToken, redirectUri } = config.google;
+
+    if (!clientId || !clientSecret || !refreshToken) {
+      throw new Error(
+        "Google OAuth2 credentials not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN.",
+      );
+    }
+
+    const oauth2Client = new google.auth.OAuth2(
+      clientId,
+      clientSecret,
+      redirectUri,
+    );
+
+    oauth2Client.setCredentials({ refresh_token: refreshToken });
+
+    return google.calendar({ version: "v3", auth: oauth2Client });
+  }
+
+  // -----------------------------------------------------------------------
+  // Fetch upcoming events
+  // -----------------------------------------------------------------------
+
+  /**
+   * Fetch events from Google Calendar for the next N hours. Returns an array
+   * of { id, summary, start, end, attendees, description, location }.
    */
   async getUpcomingEvents(hours: number = 24): Promise<CalendarEvent[]> {
-    let google: typeof import("googleapis").google;
-    try {
-      const mod = await import("googleapis");
-      google = mod.google;
-    } catch {
-      logger.warn("googleapis not available — returning empty calendar");
-      return [];
-    }
-
-    const authToken = process.env["GOOGLE_ACCESS_TOKEN"];
-    if (!authToken) {
-      logger.warn("GOOGLE_ACCESS_TOKEN not set — skipping calendar fetch");
-      return [];
-    }
-
-    const auth = new google.auth.OAuth2();
-    auth.setCredentials({ access_token: authToken });
-    const calendar = google.calendar({ version: "v3", auth });
-
-    const now = new Date();
-    const timeMax = new Date(now.getTime() + hours * 60 * 60 * 1000);
-
-    await this.log("fetch_calendar", undefined, { hours });
+    await this.log("fetch_upcoming_events", undefined, { hours });
 
     try {
+      const calendar = this.getCalendarClient();
+      const now = new Date();
+      const timeMax = new Date(now.getTime() + hours * 60 * 60 * 1000);
+
       const response = await calendar.events.list({
         calendarId: "primary",
         timeMin: now.toISOString(),
@@ -98,35 +136,29 @@ export class SchedulerAgent extends BaseAgent {
       const events: CalendarEvent[] = (response.data.items ?? []).map(
         (item) => ({
           id: item.id ?? "",
-          summary: item.summary ?? "(no title)",
-          description: item.description ?? null,
-          start: item.start?.dateTime ?? item.start?.date ?? "",
-          end: item.end?.dateTime ?? item.end?.date ?? "",
-          location: item.location ?? null,
-          attendees: (item.attendees ?? []).map((a) => ({
-            email: a.email ?? "",
-            displayName: a.displayName ?? undefined,
-            responseStatus: a.responseStatus ?? undefined,
-          })),
-          organizer: {
-            email: item.organizer?.email ?? "",
-            displayName: item.organizer?.displayName ?? undefined,
-          },
-          htmlLink: item.htmlLink ?? "",
+          summary: item.summary ?? "(No title)",
+          start:
+            item.start?.dateTime ?? item.start?.date ?? now.toISOString(),
+          end: item.end?.dateTime ?? item.end?.date ?? now.toISOString(),
+          attendees: (item.attendees ?? [])
+            .map((a) => a.email ?? "")
+            .filter(Boolean),
+          description: item.description ?? "",
+          location: item.location ?? "",
         }),
       );
 
-      await this.log("calendar_fetched", undefined, {
-        eventCount: events.length,
-        timeRange: `${hours}h`,
+      await this.log("events_fetched", undefined, {
+        count: events.length,
+        hours,
       });
 
       return events;
     } catch (err) {
-      logger.error("Calendar fetch failed", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return [];
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error("Failed to fetch calendar events", { error: message });
+      await this.log("fetch_events_error", undefined, { error: message });
+      throw err;
     }
   }
 
@@ -135,129 +167,231 @@ export class SchedulerAgent extends BaseAgent {
   // -----------------------------------------------------------------------
 
   /**
-   * Generate a pre-brief for an upcoming meeting.
-   * Pulls contact info, project context, recent notes, and open tasks.
+   * Generate a pre-meeting brief for a given calendar event:
+   * 1. Look up attendees in contacts table
+   * 2. Find associated projects
+   * 3. Pull recent notes and open tasks for those projects
+   * 4. Use Claude to generate a pre-brief with who's in the meeting,
+   *    project context, open items, and suggested talking points
    */
   async generatePreBrief(event: CalendarEvent): Promise<PreBrief> {
-    await this.log("generate_prebrief", undefined, {
+    await this.log("generate_pre_brief", undefined, {
       eventId: event.id,
       summary: event.summary,
     });
 
-    // Look up attendees in contacts
-    let contactInfo: contactsRepo.Contact | null = null;
-    for (const attendee of event.attendees) {
-      const contact = await contactsRepo.findByAnyHandle(attendee.email);
-      if (contact) {
-        contactInfo = contact;
-        break;
+    // 1. Look up attendees in contacts table
+    const attendeeDetails: PreBrief["attendeeDetails"] = [];
+    const relatedProjectIds = new Set<string>();
+
+    for (const email of event.attendees) {
+      try {
+        const contact = await contactsRepo.getByEmail(email);
+        if (contact) {
+          attendeeDetails.push({
+            name: contact.name,
+            email,
+            type: contact.type,
+            isVip: contact.is_vip,
+            notes: contact.notes,
+          });
+          if (contact.project_ids) {
+            for (const pid of contact.project_ids) {
+              relatedProjectIds.add(pid);
+            }
+          }
+        } else {
+          // Try by any handle as fallback
+          const contactByHandle = await contactsRepo.findByAnyHandle(email);
+          if (contactByHandle) {
+            attendeeDetails.push({
+              name: contactByHandle.name,
+              email,
+              type: contactByHandle.type,
+              isVip: contactByHandle.is_vip,
+              notes: contactByHandle.notes,
+            });
+            if (contactByHandle.project_ids) {
+              for (const pid of contactByHandle.project_ids) {
+                relatedProjectIds.add(pid);
+              }
+            }
+          } else {
+            attendeeDetails.push({
+              name: email.split("@")[0] ?? email,
+              email,
+              type: null,
+              isVip: false,
+              notes: null,
+            });
+          }
+        }
+      } catch (err) {
+        logger.warn("Failed to look up contact", {
+          email,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        attendeeDetails.push({
+          name: email.split("@")[0] ?? email,
+          email,
+          type: null,
+          isVip: false,
+          notes: null,
+        });
       }
     }
 
-    // Try to find related project
-    let projectContext: string | null = null;
-    let recentNotes: string[] = [];
-    let openTasks: string[] = [];
+    // 2. Find associated projects
+    const relatedProjects: PreBrief["relatedProjects"] = [];
+    for (const pid of relatedProjectIds) {
+      try {
+        const project = await projectsRepo.getById(pid);
+        if (project) {
+          relatedProjects.push({
+            id: project.id,
+            name: project.name,
+            status: project.status,
+          });
+        }
+      } catch {
+        // Skip projects that fail to load
+      }
+    }
 
-    if (contactInfo?.project_ids && contactInfo.project_ids.length > 0) {
-      const projectId = contactInfo.project_ids[0]!;
-      const project = await projectsRepo.getById(projectId);
+    // If no project matched via contacts, try keyword matching on event title
+    if (relatedProjects.length === 0) {
+      try {
+        const activeProjects = await projectsRepo.getActive();
+        for (const project of activeProjects) {
+          const titleLower = event.summary.toLowerCase();
+          const projNameLower = project.name.toLowerCase();
+          const clientLower = (project.client ?? "").toLowerCase();
+          if (
+            titleLower.includes(projNameLower) ||
+            projNameLower.includes(titleLower) ||
+            (clientLower && titleLower.includes(clientLower))
+          ) {
+            relatedProjects.push({
+              id: project.id,
+              name: project.name,
+              status: project.status,
+            });
+          }
+        }
+      } catch {
+        // Best-effort
+      }
+    }
 
-      if (project) {
-        projectContext = `${project.name}${project.client ? ` (${project.client})` : ""} — Priority ${project.priority}, Status: ${project.status}`;
+    // 3. Pull recent notes and open tasks for those projects
+    const openTasks: PreBrief["openTasks"] = [];
+    const recentNotes: PreBrief["recentNotes"] = [];
 
-        const notes = await notesRepo.getByProjectId(project.id);
-        recentNotes = notes
-          .slice(0, 3)
-          .map(
-            (n) =>
-              n.raw_text?.slice(0, 200) ??
-              JSON.stringify(n.structured)?.slice(0, 200) ??
-              "",
-          )
-          .filter((t) => t.length > 0);
-
+    for (const project of relatedProjects) {
+      try {
         const tasks = await tasksRepo.getByProjectId(project.id);
-        openTasks = tasks
-          .filter((t) => t.status === "open")
-          .slice(0, 5)
-          .map(
-            (t) =>
-              `${t.title}${t.due_date ? ` (due ${t.due_date})` : ""} — P${t.priority}`,
-          );
+        const open = tasks.filter((t) => t.status === "open");
+        for (const t of open.slice(0, 5)) {
+          openTasks.push({
+            id: t.id,
+            title: t.title,
+            priority: t.priority,
+            dueDate: t.due_date,
+          });
+        }
+      } catch {
+        // Skip on error
+      }
+
+      try {
+        const notes = await notesRepo.getByProjectId(project.id);
+        for (const n of notes.slice(0, 3)) {
+          recentNotes.push({
+            id: n.id,
+            snippet: (n.raw_text ?? "").slice(0, 200),
+            createdAt: n.created_at,
+          });
+        }
+      } catch {
+        // Skip on error
       }
     }
 
-    // Generate prep suggestions using Claude
-    const suggestedPrep = await this.generatePrepSuggestion(
-      event,
-      contactInfo,
-      projectContext,
-      recentNotes,
-      openTasks,
-    );
+    // 4. Use Claude to generate a pre-brief
+    const attendeeBlock =
+      attendeeDetails.length > 0
+        ? attendeeDetails
+            .map(
+              (a) =>
+                `- ${a.name} (${a.email})${a.isVip ? " [VIP]" : ""}${a.type ? ` | ${a.type}` : ""}${a.notes ? `\n  Context: ${a.notes}` : ""}`,
+            )
+            .join("\n")
+        : "No attendees listed.";
 
-    const preBrief: PreBrief = {
-      event,
-      contactInfo,
-      projectContext,
-      recentNotes,
-      openTasks,
-      suggestedPrep,
-    };
+    const projectBlock =
+      relatedProjects.length > 0
+        ? relatedProjects.map((p) => `- ${p.name} (${p.status})`).join("\n")
+        : "No directly related projects identified.";
 
-    await this.log("prebrief_generated", undefined, {
-      eventId: event.id,
-      hasContact: !!contactInfo,
-      hasProject: !!projectContext,
-    });
-
-    return preBrief;
-  }
-
-  private async generatePrepSuggestion(
-    event: CalendarEvent,
-    contact: contactsRepo.Contact | null,
-    projectContext: string | null,
-    recentNotes: string[],
-    openTasks: string[],
-  ): Promise<string> {
-    const contactSection = contact
-      ? `Contact: ${contact.name}${contact.type ? ` (${contact.type})` : ""}${contact.is_vip ? " — VIP" : ""}${contact.notes ? `\nNotes: ${contact.notes}` : ""}`
-      : "No matching contact in system.";
-
-    const projectSection = projectContext
-      ? `Project: ${projectContext}`
-      : "No linked project.";
-
-    const notesSection =
-      recentNotes.length > 0
-        ? `Recent Notes:\n${recentNotes.map((n) => `  - ${n}`).join("\n")}`
-        : "No recent notes.";
-
-    const tasksSection =
+    const taskBlock =
       openTasks.length > 0
-        ? `Open Tasks:\n${openTasks.map((t) => `  - ${t}`).join("\n")}`
+        ? openTasks
+            .map(
+              (t) =>
+                `- [P${t.priority}] ${t.title}${t.dueDate ? ` (due ${t.dueDate})` : ""}`,
+            )
+            .join("\n")
         : "No open tasks.";
 
-    return this.callClaude(
-      `You are a meeting prep assistant for Bryson Stevens. Bryson runs Helium Solutions (AI marketing automation agency), Search Tuners (referral marketing with Mike), and OnTrack Marketing (SaaS).
+    const notesBlock =
+      recentNotes.length > 0
+        ? recentNotes.map((n) => `- ${n.snippet}`).join("\n")
+        : "No recent notes.";
 
-Based on the meeting details and available context, suggest 2-4 specific preparation items. Be concise and actionable.`,
+    const briefingSummary = await this.callClaude(
+      `You are Bryson Stevens' executive assistant AI. Generate a concise pre-meeting brief that Bryson can scan in 30 seconds. Focus on what matters: who he is meeting, what they care about, open items, and suggested talking points.
+
+Bryson runs Helium Solutions (AI marketing automation agency), Search Tuners (referral marketing partnership with Mike), and OnTrack Marketing (SaaS in development).`,
       `Meeting: ${event.summary}
 Time: ${event.start} to ${event.end}
-${event.description ? `Description: ${event.description}` : ""}
-${event.location ? `Location: ${event.location}` : ""}
-Attendees: ${event.attendees.map((a) => a.displayName ?? a.email).join(", ")}
+Location: ${event.location || "Not specified"}
+Description: ${event.description || "None"}
 
-${contactSection}
-${projectSection}
-${notesSection}
-${tasksSection}
+Attendees:
+${attendeeBlock}
 
-What should Bryson prepare for this meeting?`,
-      { maxTokens: 512 },
+Related Projects:
+${projectBlock}
+
+Open Tasks:
+${taskBlock}
+
+Recent Notes:
+${notesBlock}
+
+Generate a pre-brief with:
+1. Quick summary of who is in the meeting and why
+2. Key context from projects and tasks
+3. Open items to potentially address
+4. 3-4 suggested talking points`,
+      { maxTokens: 1024 },
     );
+
+    await this.log("pre_brief_generated", undefined, {
+      eventId: event.id,
+      attendeeCount: attendeeDetails.length,
+      projectCount: relatedProjects.length,
+      taskCount: openTasks.length,
+    });
+
+    return {
+      event,
+      attendeeDetails,
+      relatedProjects,
+      openTasks,
+      recentNotes,
+      briefingSummary,
+    };
   }
 
   // -----------------------------------------------------------------------
@@ -265,37 +399,39 @@ What should Bryson prepare for this meeting?`,
   // -----------------------------------------------------------------------
 
   /**
-   * Find overlapping events in a list of calendar events.
+   * Find overlapping events and return an array of conflict pairs with
+   * overlap duration in minutes.
    */
-  detectConflicts(events: CalendarEvent[]): Conflict[] {
-    const conflicts: Conflict[] = [];
+  detectConflicts(events: CalendarEvent[]): ConflictPair[] {
+    const conflicts: ConflictPair[] = [];
     const sorted = [...events].sort(
       (a, b) => new Date(a.start).getTime() - new Date(b.start).getTime(),
     );
 
     for (let i = 0; i < sorted.length; i++) {
       for (let j = i + 1; j < sorted.length; j++) {
-        const event1 = sorted[i]!;
-        const event2 = sorted[j]!;
+        const a = sorted[i]!;
+        const b = sorted[j]!;
 
-        const start1 = new Date(event1.start).getTime();
-        const end1 = new Date(event1.end).getTime();
-        const start2 = new Date(event2.start).getTime();
-        const end2 = new Date(event2.end).getTime();
+        const aStart = new Date(a.start).getTime();
+        const aEnd = new Date(a.end).getTime();
+        const bStart = new Date(b.start).getTime();
+        const bEnd = new Date(b.end).getTime();
 
-        // Check for overlap: event2 starts before event1 ends
-        if (start2 < end1) {
-          const overlapStart = Math.max(start1, start2);
-          const overlapEnd = Math.min(end1, end2);
+        // Overlap: A starts before B ends AND B starts before A ends
+        if (aStart < bEnd && bStart < aEnd) {
+          const overlapStart = Math.max(aStart, bStart);
+          const overlapEnd = Math.min(aEnd, bEnd);
           const overlapMinutes = Math.round(
             (overlapEnd - overlapStart) / 60_000,
           );
 
           if (overlapMinutes > 0) {
-            conflicts.push({ event1, event2, overlapMinutes });
+            conflicts.push({ eventA: a, eventB: b, overlapMinutes });
           }
         } else {
-          // Since sorted, no more overlaps possible for event1
+          // Events are sorted, so if B starts after A ends, no more
+          // overlaps for A against later events
           break;
         }
       }
@@ -309,94 +445,165 @@ What should Bryson prepare for this meeting?`,
   // -----------------------------------------------------------------------
 
   /**
-   * Analyse calendar density and suggest deep work / admin / break blocks.
+   * Analyze calendar density, find gaps, and suggest blocks for deep work
+   * vs admin vs break. Returns array of { start, end, type, reason }.
    */
   suggestTimeBlocks(events: CalendarEvent[]): TimeBlockSuggestion[] {
     const suggestions: TimeBlockSuggestion[] = [];
-    const sorted = [...events].sort(
-      (a, b) => new Date(a.start).getTime() - new Date(b.start).getTime(),
-    );
 
-    if (sorted.length === 0) {
-      // Full day free — suggest a deep work block
+    if (events.length === 0) {
       const today = new Date();
-      today.setHours(9, 0, 0, 0);
-      const end = new Date(today);
-      end.setHours(12, 0, 0, 0);
+      const dayStart = new Date(today);
+      dayStart.setHours(9, 0, 0, 0);
+      const dayEnd = new Date(today);
+      dayEnd.setHours(17, 0, 0, 0);
 
       suggestions.push({
-        start: today.toISOString(),
-        end: end.toISOString(),
-        durationMinutes: 180,
+        start: dayStart.toISOString(),
+        end: dayEnd.toISOString(),
         type: "deep_work",
-        reason: "No meetings today — ideal for a 3-hour deep work block.",
+        reason: "No meetings scheduled. Use the full day for deep, focused work.",
       });
       return suggestions;
     }
 
-    // Work hours: 8 AM to 6 PM
-    const dayStart = new Date(sorted[0]!.start);
-    dayStart.setHours(8, 0, 0, 0);
-    const dayEnd = new Date(dayStart);
-    dayEnd.setHours(18, 0, 0, 0);
+    const sorted = [...events].sort(
+      (a, b) => new Date(a.start).getTime() - new Date(b.start).getTime(),
+    );
 
-    // Find gaps between events
-    let cursor = dayStart.getTime();
+    // Determine work-day boundaries from first event's date
+    const dayRef = new Date(sorted[0]!.start);
+    const workStart = new Date(dayRef);
+    workStart.setHours(8, 0, 0, 0);
+    const workEnd = new Date(dayRef);
+    workEnd.setHours(18, 0, 0, 0);
 
-    for (const event of sorted) {
-      const eventStart = new Date(event.start).getTime();
-      const eventEnd = new Date(event.end).getTime();
+    // Collect all gaps
+    const gaps: Array<{ start: Date; end: Date }> = [];
 
-      if (eventStart > cursor) {
-        const gapMinutes = Math.round((eventStart - cursor) / 60_000);
-
-        if (gapMinutes >= 120) {
-          suggestions.push({
-            start: new Date(cursor).toISOString(),
-            end: new Date(eventStart).toISOString(),
-            durationMinutes: gapMinutes,
-            type: "deep_work",
-            reason: `${gapMinutes}-minute gap before "${event.summary}" — good for focused work.`,
-          });
-        } else if (gapMinutes >= 30) {
-          suggestions.push({
-            start: new Date(cursor).toISOString(),
-            end: new Date(eventStart).toISOString(),
-            durationMinutes: gapMinutes,
-            type: "admin",
-            reason: `${gapMinutes}-minute gap — good for emails, quick tasks, or admin.`,
-          });
-        } else if (gapMinutes >= 10) {
-          suggestions.push({
-            start: new Date(cursor).toISOString(),
-            end: new Date(eventStart).toISOString(),
-            durationMinutes: gapMinutes,
-            type: "break",
-            reason: `Short ${gapMinutes}-minute gap — take a break.`,
-          });
-        }
-      }
-
-      cursor = Math.max(cursor, eventEnd);
+    // Gap before first event
+    const firstStart = new Date(sorted[0]!.start);
+    if (firstStart.getTime() > workStart.getTime()) {
+      gaps.push({ start: workStart, end: firstStart });
     }
 
-    // After last event until end of work day
-    if (cursor < dayEnd.getTime()) {
-      const remainingMinutes = Math.round(
-        (dayEnd.getTime() - cursor) / 60_000,
+    // Gaps between events
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const currentEnd = new Date(sorted[i]!.end);
+      const nextStart = new Date(sorted[i + 1]!.start);
+      if (nextStart.getTime() > currentEnd.getTime()) {
+        gaps.push({ start: currentEnd, end: nextStart });
+      }
+    }
+
+    // Gap after last event
+    const lastEnd = new Date(sorted[sorted.length - 1]!.end);
+    if (lastEnd.getTime() < workEnd.getTime()) {
+      gaps.push({ start: lastEnd, end: workEnd });
+    }
+
+    for (const gap of gaps) {
+      const durationMin = Math.round(
+        (gap.end.getTime() - gap.start.getTime()) / 60_000,
       );
-      if (remainingMinutes >= 60) {
+
+      if (durationMin < 15) {
+        continue; // Too short
+      }
+
+      if (durationMin >= 90) {
         suggestions.push({
-          start: new Date(cursor).toISOString(),
-          end: dayEnd.toISOString(),
-          durationMinutes: remainingMinutes,
+          start: gap.start.toISOString(),
+          end: gap.end.toISOString(),
           type: "deep_work",
-          reason: `${remainingMinutes} minutes after last meeting — finish the day with focused work.`,
+          reason: `${durationMin} min block. Enough for a deep work session on a priority task.`,
+        });
+      } else if (durationMin >= 30) {
+        suggestions.push({
+          start: gap.start.toISOString(),
+          end: gap.end.toISOString(),
+          type: "admin",
+          reason: `${durationMin} min block. Good for emails, Slack catch-up, or quick admin tasks.`,
+        });
+      } else {
+        suggestions.push({
+          start: gap.start.toISOString(),
+          end: gap.end.toISOString(),
+          type: "break",
+          reason: `${durationMin} min gap. Step away, stretch, or grab coffee.`,
         });
       }
     }
 
+    // Warn about back-to-back meetings
+    let consecutiveCount = 0;
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const currentEnd = new Date(sorted[i]!.end).getTime();
+      const nextStart = new Date(sorted[i + 1]!.start).getTime();
+      if (nextStart - currentEnd < 10 * 60 * 1000) {
+        consecutiveCount++;
+      }
+    }
+
+    if (consecutiveCount >= 3) {
+      suggestions.push({
+        start: "",
+        end: "",
+        type: "break",
+        reason: `Warning: ${consecutiveCount + 1} back-to-back meetings detected. Consider rescheduling one to create buffer time.`,
+      });
+    }
+
     return suggestions;
+  }
+
+  // -----------------------------------------------------------------------
+  // Daily schedule summary
+  // -----------------------------------------------------------------------
+
+  /**
+   * Combines getUpcomingEvents + detectConflicts + suggestTimeBlocks into
+   * one comprehensive summary object.
+   */
+  async getDailyScheduleSummary(): Promise<DailyScheduleSummary> {
+    await this.log("daily_schedule_summary_start");
+
+    const events = await this.getUpcomingEvents(24);
+    const conflicts = this.detectConflicts(events);
+    const suggestedBlocks = this.suggestTimeBlocks(events);
+
+    // Calculate total meeting time
+    let totalMeetingMs = 0;
+    for (const event of events) {
+      const start = new Date(event.start).getTime();
+      const end = new Date(event.end).getTime();
+      totalMeetingMs += Math.max(0, end - start);
+    }
+    const totalMeetingHours =
+      Math.round((totalMeetingMs / (1000 * 60 * 60)) * 10) / 10;
+
+    // Assume a 10-hour working day
+    const freeHours =
+      Math.round(Math.max(0, 10 - totalMeetingHours) * 10) / 10;
+
+    const summary: DailyScheduleSummary = {
+      date: new Date().toISOString().split("T")[0]!,
+      events,
+      conflicts,
+      suggestedBlocks,
+      totalMeetingHours,
+      freeHours,
+    };
+
+    await this.log("daily_schedule_summary_complete", undefined, {
+      eventCount: events.length,
+      conflictCount: conflicts.length,
+      suggestedBlockCount: suggestedBlocks.length,
+      totalMeetingHours,
+      freeHours,
+    });
+
+    return summary;
   }
 
   // -----------------------------------------------------------------------
@@ -413,93 +620,89 @@ What should Bryson prepare for this meeting?`,
     }
 
     try {
-      const hours =
-        (event.data["hours"] as number | undefined) ?? 24;
-      const generateBriefs =
-        (event.data["generateBriefs"] as boolean | undefined) ?? true;
+      const action = (event.data["action"] as string) ?? "daily_summary";
 
-      await this.log("calendar_check_start", undefined, { hours });
-
-      const events = await this.getUpcomingEvents(hours);
-
-      // Detect conflicts
-      const conflicts = this.detectConflicts(events);
-      if (conflicts.length > 0) {
-        await this.log("conflicts_detected", undefined, {
-          count: conflicts.length,
-        });
-      }
-
-      // Suggest time blocks
-      const timeBlocks = this.suggestTimeBlocks(events);
-
-      // Generate pre-briefs for upcoming meetings
-      const preBriefs: PreBrief[] = [];
-      if (generateBriefs) {
-        for (const ev of events.slice(0, 5)) {
-          // Limit to next 5 events
-          try {
-            const brief = await this.generatePreBrief(ev);
-            preBriefs.push(brief);
-          } catch (err) {
-            logger.error("Pre-brief generation failed", {
-              eventId: ev.id,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
+      switch (action) {
+        case "daily_summary": {
+          const summary = await this.getDailyScheduleSummary();
+          return {
+            status: summary.conflicts.length > 0 ? "partial" : "success",
+            agent: this.name,
+            message: `Daily schedule: ${summary.events.length} events, ${summary.conflicts.length} conflicts, ${summary.freeHours}h free`,
+            data: summary as unknown as Record<string, unknown>,
+            escalation:
+              summary.conflicts.length > 0
+                ? {
+                    summary: `${summary.conflicts.length} scheduling conflict(s) detected`,
+                    context: summary.conflicts
+                      .map(
+                        (c) =>
+                          `"${c.eventA.summary}" overlaps "${c.eventB.summary}" by ${c.overlapMinutes}min`,
+                      )
+                      .join("\n"),
+                  }
+                : undefined,
+          };
         }
+
+        case "pre_brief": {
+          const eventId = event.data["eventId"] as string;
+          if (!eventId) {
+            return {
+              status: "error",
+              agent: this.name,
+              message: "pre_brief action requires an eventId",
+            };
+          }
+
+          const events = await this.getUpcomingEvents(72);
+          const targetEvent = events.find((e) => e.id === eventId);
+          if (!targetEvent) {
+            return {
+              status: "error",
+              agent: this.name,
+              message: `Event ${eventId} not found in upcoming events`,
+            };
+          }
+
+          const brief = await this.generatePreBrief(targetEvent);
+          return {
+            status: "success",
+            agent: this.name,
+            message: `Pre-brief generated for: ${targetEvent.summary}`,
+            data: brief as unknown as Record<string, unknown>,
+          };
+        }
+
+        case "upcoming": {
+          const hours = (event.data["hours"] as number) ?? 24;
+          const events = await this.getUpcomingEvents(hours);
+          return {
+            status: "success",
+            agent: this.name,
+            message: `Found ${events.length} events in next ${hours} hours`,
+            data: { events } as Record<string, unknown>,
+          };
+        }
+
+        default:
+          return {
+            status: "error",
+            agent: this.name,
+            message: `Unknown scheduler action: ${action}`,
+          };
       }
-
-      await this.log("calendar_check_complete", undefined, {
-        eventCount: events.length,
-        conflictCount: conflicts.length,
-        timeBlockCount: timeBlocks.length,
-        preBriefCount: preBriefs.length,
-      });
-
-      return {
-        status: conflicts.length > 0 ? "partial" : "success",
-        agent: this.name,
-        message: `Calendar: ${events.length} events, ${conflicts.length} conflicts, ${timeBlocks.length} suggested time blocks`,
-        data: {
-          events: events.map((e) => ({
-            id: e.id,
-            summary: e.summary,
-            start: e.start,
-            end: e.end,
-            attendeeCount: e.attendees.length,
-          })),
-          conflicts: conflicts.map((c) => ({
-            event1: c.event1.summary,
-            event2: c.event2.summary,
-            overlapMinutes: c.overlapMinutes,
-          })),
-          timeBlocks,
-          preBriefs: preBriefs.map((pb) => ({
-            event: pb.event.summary,
-            hasContact: !!pb.contactInfo,
-            hasProject: !!pb.projectContext,
-            suggestedPrep: pb.suggestedPrep,
-          })),
-        },
-        escalation:
-          conflicts.length > 0
-            ? {
-                summary: `📅 ${conflicts.length} scheduling conflict(s) detected`,
-                context: conflicts
-                  .map(
-                    (c) =>
-                      `"${c.event1.summary}" overlaps with "${c.event2.summary}" by ${c.overlapMinutes}min`,
-                  )
-                  .join("\n"),
-              }
-            : undefined,
-      };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error("Scheduler agent error", { error: message });
-      await this.log("scheduler_error", undefined, { error: message });
+      await this.log("scheduler_error", event.projectId, { error: message });
       return { status: "error", agent: this.name, message };
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Singleton
+// ---------------------------------------------------------------------------
+
+export const schedulerAgent = new SchedulerAgent();

@@ -77,3 +77,13 @@ export async function markDismissed(id: string): Promise<Escalation | null> {
   );
   return result.rows[0] ?? null;
 }
+
+export async function setTelegramMessageId(
+  id: string,
+  messageId: string,
+): Promise<void> {
+  await query(
+    "UPDATE escalations SET telegram_message_id = $1 WHERE id = $2",
+    [messageId, id],
+  );
+}

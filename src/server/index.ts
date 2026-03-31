@@ -62,7 +62,7 @@ export function createServer() {
   app.use("/api/tasks", tasksRouter);
   app.use("/api/escalations", escalationsRouter);
   app.use("/api/notes", notesRouter);
-  app.use("/api/ingest", notesRouter); // POST /api/ingest handled by notesRouter
+  app.use("/api/ingest", ingestRouter);
   app.use("/api/contacts", contactsRouter);
   app.use("/api/briefing", briefingRouter);
 

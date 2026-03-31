@@ -1,6 +1,6 @@
 import { Telegraf, Markup } from "telegraf";
 import type { Context, NarrowedContext } from "telegraf";
-import type { CallbackQuery, Update } from "telegraf/types";
+import type { Update } from "telegraf/types";
 import { config } from "../../config/index.js";
 import { logger } from "../../config/logger.js";
 import * as agentLogs from "../../db/repositories/agent-logs.js";
@@ -37,8 +37,8 @@ export class TelegramSubAgent {
   private authorizedChatId: string;
 
   constructor() {
-    this.bot = new Telegraf(config.telegram.botToken);
-    this.authorizedChatId = config.telegram.chatId;
+    this.bot = new Telegraf(config.telegram.botToken ?? "");
+    this.authorizedChatId = config.telegram.brysonChatId ?? "";
   }
 
   /** Return the underlying Telegraf instance for webhook/polling setup. */
@@ -209,11 +209,12 @@ export class TelegramSubAgent {
         { parse_mode: "Markdown", ...keyboard },
       );
 
-      // Store the telegram message ID on the escalation
-      await escalationsRepo.create({
-        ...escalation,
-        telegram_message_id: String(msg.message_id),
-      });
+      // Store the telegram message ID on the escalation record
+      const { query: dbQuery } = await import("../../db/connection.js");
+      await dbQuery(
+        "UPDATE escalations SET telegram_message_id = $1 WHERE id = $2",
+        [String(msg.message_id), escalation.id],
+      );
 
       await agentLogs.log({
         agent: "inbox.telegram",

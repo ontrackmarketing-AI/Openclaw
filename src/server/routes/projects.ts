@@ -18,7 +18,7 @@ projectsRouter.get("/", async (_req: Request, res: Response) => {
 // GET /api/projects/:id
 projectsRouter.get("/:id", async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = req.params["id"] as string;
     if (!id) {
       res.status(400).json({ error: "Missing project id" });
       return;

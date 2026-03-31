@@ -186,7 +186,7 @@ export class IngestionAgent extends BaseAgent {
       unmatchedRefs: unmatched,
     };
 
-    await this.log("process_image_complete", primaryProjectId, {
+    await this.log("process_image_complete", primaryProjectId ?? undefined, {
       noteId: note.id,
       taskCount: result.taskCount,
     });

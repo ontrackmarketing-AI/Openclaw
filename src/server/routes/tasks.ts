@@ -64,7 +64,7 @@ tasksRouter.post("/", async (req: Request, res: Response) => {
 // PATCH /api/tasks/:id
 tasksRouter.patch("/:id", async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = req.params["id"] as string;
     if (!id) {
       res.status(400).json({ error: "Missing task id" });
       return;

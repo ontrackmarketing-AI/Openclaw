@@ -1,5 +1,5 @@
 import { Telegraf, type Context } from "telegraf";
-import type { Update, Message } from "telegraf/types";
+import type { Message } from "telegraf/types";
 import { config } from "../config/index.js";
 import { logger } from "../config/logger.js";
 import {
@@ -24,11 +24,6 @@ function bold(text: string): string {
 
 function code(text: string): string {
   return `\`${text.replace(/[`\\]/g, "\\$&")}\``;
-}
-
-function codeBlock(text: string, lang = ""): string {
-  const escaped = text.replace(/`/g, "\\`");
-  return `\`\`\`${lang}\n${escaped}\n\`\`\``;
 }
 
 // ---------------------------------------------------------------------------

@@ -81,7 +81,7 @@ async function checkRedis(): Promise<void> {
 // ---------------------------------------------------------------------------
 // Cron jobs
 // ---------------------------------------------------------------------------
-const cronJobs: cron.ScheduledTask[] = [];
+const cronJobs: ReturnType<typeof cron.schedule>[] = [];
 
 function startCronJobs(): void {
   // Morning briefing: 8:00 AM CST daily

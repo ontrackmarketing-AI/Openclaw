@@ -18,7 +18,7 @@ escalationsRouter.get("/", async (_req: Request, res: Response) => {
 // POST /api/escalations/:id/action
 escalationsRouter.post("/:id/action", async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    const id = req.params["id"] as string;
     if (!id) {
       res.status(400).json({ error: "Missing escalation id" });
       return;

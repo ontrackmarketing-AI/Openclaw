@@ -1,31 +1,50 @@
 import { BaseAgent, AgentEvent, AgentResult } from "../base.js";
 import { logger } from "../../config/logger.js";
-import * as escalationsRepo from "../../db/repositories/escalations.js";
-import * as tasksRepo from "../../db/repositories/tasks.js";
 import * as projectsRepo from "../../db/repositories/projects.js";
-import * as notesRepo from "../../db/repositories/notes.js";
-import * as agentLogs from "../../db/repositories/agent-logs.js";
+import * as tasksRepo from "../../db/repositories/tasks.js";
+import * as escalationsRepo from "../../db/repositories/escalations.js";
+import * as agentLogsRepo from "../../db/repositories/agent-logs.js";
 import * as inboxEventsRepo from "../../db/repositories/inbox-events.js";
+import * as notesRepo from "../../db/repositories/notes.js";
 import { SchedulerAgent } from "../scheduler/index.js";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-interface DailyBriefingData {
+export interface BriefingData {
   date: string;
   pendingEscalations: escalationsRepo.Escalation[];
-  handledOvernight: string[];
-  calendarEvents: { title: string; time: string; attendees: string }[];
-  topPriorities: { title: string; project: string; dueDate: string | null }[];
+  handledOvernight: Array<{
+    agent: string;
+    event: string;
+    summary: string;
+  }>;
+  calendarEvents: Array<{
+    summary: string;
+    time: string;
+    hasBrief: boolean;
+  }>;
+  openTasks: tasksRepo.Task[];
   overdueTasks: tasksRepo.Task[];
-  recentInboxSummary: string;
+  topPriorities: string[];
+  inboxSummary: string;
   stats: {
     totalOpenTasks: number;
-    tasksCompletedToday: number;
-    escalationsResolved: number;
-    notesIngested: number;
+    tasksCompletedLast24h: number;
+    escalationsPending: number;
+    notesIngestedLast24h: number;
   };
+}
+
+export interface ProjectStatusData {
+  project: projectsRepo.Project;
+  openTasks: tasksRepo.Task[];
+  completedTasks: tasksRepo.Task[];
+  recentNotes: notesRepo.Note[];
+  recentInboxEvents: inboxEventsRepo.InboxEvent[];
+  escalationHistory: escalationsRepo.Escalation[];
+  narrativeSummary: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -41,18 +60,17 @@ export class ReportingAgent extends BaseAgent {
   }
 
   // -----------------------------------------------------------------------
-  // Daily briefing
+  // Daily Briefing
   // -----------------------------------------------------------------------
 
   /**
-   * Aggregate the last 24 hours of data across all systems and produce
-   * a structured briefing.
+   * The core function. Aggregates data from all systems and uses Claude to
+   * derive top 3 priorities. Returns a structured BriefingData object.
    */
-  async generateDailyBriefing(): Promise<DailyBriefingData> {
+  async generateDailyBriefing(): Promise<BriefingData> {
     await this.log("briefing_generation_start");
 
     const now = new Date();
-    const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
     const todayStr = now.toLocaleDateString("en-US", {
       weekday: "long",
       year: "numeric",
@@ -60,41 +78,60 @@ export class ReportingAgent extends BaseAgent {
       day: "numeric",
     });
 
-    // 1. Pending escalations
-    const pendingEscalations = await escalationsRepo.getPending();
+    // 1. Pending escalations (status='pending')
+    let pendingEscalations: escalationsRepo.Escalation[] = [];
+    try {
+      pendingEscalations = await escalationsRepo.getPending();
+    } catch (err) {
+      logger.error("Failed to fetch pending escalations", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
 
-    // 2. Agent actions completed overnight (from agent_logs)
-    const recentLogs = await agentLogs.getRecent(200);
+    // 2. Agent actions from last 24h from agent_logs
+    let recentLogs: agentLogsRepo.AgentLog[] = [];
+    try {
+      recentLogs = await agentLogsRepo.getRecent(200);
+    } catch (err) {
+      logger.error("Failed to fetch recent agent logs", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     const handledOvernight = recentLogs
       .filter(
         (l) =>
           l.event.includes("complete") ||
           l.event.includes("handled") ||
           l.event.includes("processed") ||
-          l.event.includes("stored"),
+          l.event.includes("stored") ||
+          l.event.includes("sent"),
       )
-      .slice(0, 10)
+      .slice(0, 15)
       .map((l) => {
-        const meta = l.metadata;
+        const meta = l.metadata ?? {};
         const detail =
           (meta["message"] as string) ??
-          (meta["noteId"] as string) ??
-          (meta["threadId"] as string) ??
+          (meta["subject"] as string) ??
+          (meta["query"] as string) ??
           "";
-        return `[${l.agent}] ${l.event}${detail ? `: ${detail}` : ""}`;
+        return {
+          agent: l.agent,
+          event: l.event,
+          summary: detail
+            ? `${l.agent}: ${l.event} - ${detail}`
+            : `${l.agent}: ${l.event}`,
+        };
       });
 
-    // 3. Today's calendar events
-    let calendarEvents: { title: string; time: string; attendees: string }[] =
-      [];
+    // 3. Calendar events for today (call schedulerAgent if available)
+    let calendarEvents: BriefingData["calendarEvents"] = [];
     try {
-      const events = await this.scheduler.getUpcomingEvents(16); // next 16 hours
+      const events = await this.scheduler.getUpcomingEvents(16);
       calendarEvents = events.map((e) => ({
-        title: e.summary,
+        summary: e.summary,
         time: formatTime(e.start),
-        attendees: e.attendees
-          .map((a) => a.displayName ?? a.email)
-          .join(", "),
+        hasBrief: true,
       }));
     } catch (err) {
       logger.warn("Could not fetch calendar for briefing", {
@@ -102,53 +139,89 @@ export class ReportingAgent extends BaseAgent {
       });
     }
 
-    // 4. Top 3 priorities (highest urgency tasks across top-priority projects)
-    const topPriorities = await this.computeTopPriorities();
+    // 4. Open tasks sorted by priority
+    let openTasks: tasksRepo.Task[] = [];
+    let overdueTasks: tasksRepo.Task[] = [];
+    try {
+      openTasks = await tasksRepo.getOpen();
+    } catch (err) {
+      logger.error("Failed to fetch open tasks", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    try {
+      overdueTasks = await tasksRepo.getOverdue();
+    } catch (err) {
+      logger.error("Failed to fetch overdue tasks", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
 
-    // 5. Overdue tasks
-    const overdueTasks = await tasksRepo.getOverdue();
+    // Inbox summary
+    let recentInbox: inboxEventsRepo.InboxEvent[] = [];
+    try {
+      recentInbox = await inboxEventsRepo.getRecent(30);
+    } catch (err) {
+      logger.error("Failed to fetch recent inbox events", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    const inboxSummary = this.summarizeInbox(recentInbox);
 
-    // 6. Recent inbox summary
-    const recentInbox = await inboxEventsRepo.getRecent(20);
-    const recentInboxSummary = this.summarizeRecentInbox(recentInbox);
+    // Notes ingested in last 24h
+    let notesIngestedLast24h = 0;
+    try {
+      const allNotes = await notesRepo.getAll();
+      const cutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+      notesIngestedLast24h = allNotes.filter(
+        (n) => new Date(n.created_at) >= cutoff,
+      ).length;
+    } catch {
+      // Non-critical
+    }
 
-    // 7. Stats
-    const allOpenTasks = await tasksRepo.getOpen();
-    const recentNotes = await this.getNotesCreatedSince(twentyFourHoursAgo);
-    // Count resolved escalations: check logs for escalation_handled events
-    const escalationsResolved = recentLogs.filter(
+    // Tasks completed count from logs
+    const tasksCompletedLast24h = recentLogs.filter(
       (l) =>
-        l.event === "escalation_handled" ||
-        l.event === "result_escalated",
+        l.event.includes("done") ||
+        l.event.includes("completed") ||
+        l.event.includes("task_closed"),
     ).length;
 
-    // Tasks completed — look for tasks updated to "done" recently
-    // We approximate by checking agent logs for "done" events
-    const tasksCompletedToday = recentLogs.filter(
-      (l) => l.event.includes("done") || l.event.includes("completed"),
-    ).length;
+    // 5. Use Claude to derive top 3 priorities from all the data
+    const topPriorities = await this.deriveTopPriorities({
+      pendingEscalations,
+      openTasks,
+      overdueTasks,
+      calendarEvents,
+      handledOvernight,
+    });
 
-    const data: DailyBriefingData = {
+    const stats: BriefingData["stats"] = {
+      totalOpenTasks: openTasks.length,
+      tasksCompletedLast24h,
+      escalationsPending: pendingEscalations.length,
+      notesIngestedLast24h,
+    };
+
+    const data: BriefingData = {
       date: todayStr,
       pendingEscalations,
       handledOvernight,
       calendarEvents,
-      topPriorities,
+      openTasks,
       overdueTasks,
-      recentInboxSummary,
-      stats: {
-        totalOpenTasks: allOpenTasks.length,
-        tasksCompletedToday,
-        escalationsResolved,
-        notesIngested: recentNotes.length,
-      },
+      topPriorities,
+      inboxSummary,
+      stats,
     };
 
     await this.log("briefing_generated", undefined, {
-      pendingEscalations: pendingEscalations.length,
-      handledOvernight: handledOvernight.length,
-      calendarEvents: calendarEvents.length,
-      overdueTasks: overdueTasks.length,
+      escalationCount: pendingEscalations.length,
+      handledCount: handledOvernight.length,
+      calendarCount: calendarEvents.length,
+      openTaskCount: openTasks.length,
+      overdueCount: overdueTasks.length,
     });
 
     return data;
@@ -159,84 +232,93 @@ export class ReportingAgent extends BaseAgent {
   // -----------------------------------------------------------------------
 
   /**
-   * Format the structured briefing data as a Telegram message.
-   * Matches the PRD Section 3 format.
+   * Format as the Telegram message from the PRD. Uses simple text formatting
+   * with no emoji for Telegram MarkdownV2 compatibility. Special characters
+   * are escaped.
    */
-  formatBriefing(data: DailyBriefingData): string {
+  formatBriefing(data: BriefingData): string {
     const sections: string[] = [];
 
     // Header
-    sections.push(`☀️ *Daily Briefing — ${data.date}*`);
+    sections.push(`MORNING BRIEFING \\-\\- ${escapeMarkdownV2(data.date)}`);
 
-    // Stats bar
+    // NEEDS YOU TODAY (pending escalations)
+    sections.push("");
     sections.push(
-      `\n📊 ${data.stats.totalOpenTasks} open tasks | ${data.stats.tasksCompletedToday} completed | ${data.stats.notesIngested} notes ingested`,
+      `NEEDS YOU TODAY \\(${data.pendingEscalations.length}\\)`,
     );
-
-    // NEEDS YOU TODAY
     if (data.pendingEscalations.length > 0) {
-      sections.push("\n🚨 *NEEDS YOU TODAY*");
       for (const esc of data.pendingEscalations) {
-        const typeTag = esc.type ? `[${esc.type}] ` : "";
-        sections.push(`  • ${typeTag}${esc.summary}`);
+        const projectLabel = esc.project_id ?? "general";
+        sections.push(
+          `  \\- ${escapeMarkdownV2(projectLabel)}: ${escapeMarkdownV2(esc.summary)}`,
+        );
       }
     } else {
-      sections.push("\n✨ *No pending escalations — clean slate.*");
+      sections.push("  No pending escalations\\.");
     }
 
-    // OVERDUE
+    // Overdue tasks
     if (data.overdueTasks.length > 0) {
-      sections.push("\n⏰ *OVERDUE*");
+      sections.push("");
+      sections.push(`OVERDUE \\(${data.overdueTasks.length}\\)`);
       for (const task of data.overdueTasks.slice(0, 5)) {
         sections.push(
-          `  • ${task.title}${task.due_date ? ` (was due ${task.due_date})` : ""} — P${task.priority}`,
+          `  \\- ${escapeMarkdownV2(task.title)}${task.due_date ? ` \\(was due ${escapeMarkdownV2(task.due_date)}\\)` : ""}`,
         );
       }
       if (data.overdueTasks.length > 5) {
         sections.push(
-          `  ... and ${data.overdueTasks.length - 5} more overdue`,
+          `  \\.\\.\\. and ${data.overdueTasks.length - 5} more overdue`,
         );
       }
     }
 
     // HANDLED OVERNIGHT
+    sections.push("");
+    sections.push(
+      `HANDLED OVERNIGHT \\(${data.handledOvernight.length}\\)`,
+    );
     if (data.handledOvernight.length > 0) {
-      sections.push("\n✅ *HANDLED OVERNIGHT*");
       for (const item of data.handledOvernight.slice(0, 8)) {
-        sections.push(`  • ${item}`);
+        sections.push(`  \\- ${escapeMarkdownV2(item.summary)}`);
       }
       if (data.handledOvernight.length > 8) {
         sections.push(
-          `  ... and ${data.handledOvernight.length - 8} more actions`,
+          `  \\.\\.\\. and ${data.handledOvernight.length - 8} more actions`,
         );
       }
+    } else {
+      sections.push("  No overnight actions\\.");
     }
 
     // TODAY'S CALENDAR
+    sections.push("");
+    sections.push("TODAY'S CALENDAR");
     if (data.calendarEvents.length > 0) {
-      sections.push("\n📅 *TODAY'S CALENDAR*");
       for (const event of data.calendarEvents) {
-        sections.push(`  • ${event.time} — *${event.title}*`);
-        if (event.attendees) {
-          sections.push(`    _with ${event.attendees}_`);
-        }
+        const briefNote = event.hasBrief
+          ? " \\-\\- prep brief ready"
+          : "";
+        sections.push(
+          `  \\- ${escapeMarkdownV2(event.time)} \\-\\- ${escapeMarkdownV2(event.summary)}${briefNote}`,
+        );
       }
     } else {
-      sections.push("\n📅 *No meetings today.*");
+      sections.push("  No meetings today\\.");
     }
 
-    // TOP PRIORITIES
+    // TOP 3 PRIORITIES
+    sections.push("");
+    sections.push("TOP 3 PRIORITIES");
     if (data.topPriorities.length > 0) {
-      sections.push("\n🎯 *TOP PRIORITIES*");
-      for (const p of data.topPriorities) {
-        const due = p.dueDate ? ` (due ${p.dueDate})` : "";
-        sections.push(`  • ${p.title} — _${p.project}_${due}`);
+      for (let i = 0; i < data.topPriorities.length; i++) {
+        sections.push(
+          `${i + 1}\\. ${escapeMarkdownV2(data.topPriorities[i]!)}`,
+        );
       }
-    }
-
-    // INBOX SUMMARY
-    if (data.recentInboxSummary) {
-      sections.push(`\n📬 *INBOX* — ${data.recentInboxSummary}`);
+    } else {
+      sections.push("  No priorities derived\\.");
     }
 
     return sections.join("\n");
@@ -247,68 +329,185 @@ export class ReportingAgent extends BaseAgent {
   // -----------------------------------------------------------------------
 
   /**
-   * Generate a status report for a single project.
+   * Generate a status report for one project: open tasks, recent notes,
+   * recent inbox events, escalation history.
    */
-  async generateProjectStatus(projectId: string): Promise<string> {
+  async generateProjectStatus(projectId: string): Promise<ProjectStatusData> {
     await this.log("project_status_start", projectId);
 
     const project = await projectsRepo.getById(projectId);
     if (!project) {
-      return `Project not found: ${projectId}`;
+      throw new Error(`Project not found: ${projectId}`);
     }
 
-    const openTasks = await tasksRepo.getByProjectId(projectId);
-    const activeTasks = openTasks.filter((t) => t.status === "open");
-    const doneTasks = openTasks.filter((t) => t.status === "done");
-    const recentNotes = await notesRepo.getByProjectId(projectId);
-    const pendingEscalations = (await escalationsRepo.getPending()).filter(
+    // Fetch all project data in parallel
+    const [allTasks, recentNotes, allEscalations, recentInbox] =
+      await Promise.all([
+        tasksRepo.getByProjectId(projectId).catch(() => [] as tasksRepo.Task[]),
+        notesRepo.getByProjectId(projectId).catch(() => [] as notesRepo.Note[]),
+        escalationsRepo.getPending().catch(
+          () => [] as escalationsRepo.Escalation[],
+        ),
+        inboxEventsRepo.getRecent(50).catch(
+          () => [] as inboxEventsRepo.InboxEvent[],
+        ),
+      ]);
+
+    const openTasks = allTasks.filter((t) => t.status === "open");
+    const completedTasks = allTasks.filter((t) => t.status === "done");
+
+    // Filter escalations and inbox events to this project
+    const escalationHistory = allEscalations.filter(
+      (e) => e.project_id === projectId,
+    );
+    const recentInboxEvents = recentInbox.filter(
       (e) => e.project_id === projectId,
     );
 
-    // Use Claude to generate a narrative summary
-    const narrative = await this.callClaude(
-      `You are a project status report generator for Bryson Stevens' personal operating system.
-Generate a concise project status update (under 200 words). Be specific and actionable.`,
+    // Generate narrative summary with Claude
+    const narrativeSummary = await this.callClaude(
+      `You are a project status report generator for Bryson Stevens' personal OS.
+Generate a concise project status update. Be specific and actionable. Under 200 words.`,
       `Project: ${project.name}${project.client ? ` (Client: ${project.client})` : ""}
-Priority: ${project.priority}
-Status: ${project.status}
+Priority: P${project.priority} | Status: ${project.status}
 
-Open Tasks (${activeTasks.length}):
-${activeTasks.slice(0, 10).map((t) => `  - ${t.title} (P${t.priority}${t.due_date ? `, due ${t.due_date}` : ""})`).join("\n")}
+Open Tasks (${openTasks.length}):
+${openTasks
+  .slice(0, 10)
+  .map(
+    (t) =>
+      `- ${t.title} (P${t.priority}${t.due_date ? `, due ${t.due_date}` : ""})`,
+  )
+  .join("\n") || "None"}
 
-Completed Tasks: ${doneTasks.length}
+Completed Tasks: ${completedTasks.length}
 
 Recent Notes (${recentNotes.length}):
-${recentNotes.slice(0, 3).map((n) => `  - ${n.raw_text?.slice(0, 100) ?? "structured note"} (${n.created_at})`).join("\n")}
+${recentNotes
+  .slice(0, 5)
+  .map((n) => `- ${(n.raw_text ?? "").slice(0, 120)}`)
+  .join("\n") || "None"}
 
-Pending Escalations: ${pendingEscalations.length}
-${pendingEscalations.map((e) => `  - ${e.summary}`).join("\n")}
+Pending Escalations (${escalationHistory.length}):
+${escalationHistory.map((e) => `- ${e.summary}`).join("\n") || "None"}
 
-Generate a brief status update.`,
+Recent Inbox Activity (${recentInboxEvents.length}):
+${recentInboxEvents
+  .slice(0, 5)
+  .map(
+    (e) =>
+      `- [${e.channel}] ${e.subject ?? e.body_summary ?? "no subject"}`,
+  )
+  .join("\n") || "None"}
+
+Write a brief status update with key observations and recommended next steps.`,
       { maxTokens: 512 },
     );
 
-    const report = [
-      `📊 *Project Status: ${project.name}*`,
-      project.client ? `Client: ${project.client}` : "",
-      `Priority: P${project.priority} | Status: ${project.status}`,
-      "",
-      narrative,
-      "",
-      `📝 ${activeTasks.length} open tasks | ✅ ${doneTasks.length} completed | 📄 ${recentNotes.length} notes`,
-      pendingEscalations.length > 0
-        ? `🚨 ${pendingEscalations.length} pending escalation(s)`
-        : "",
-    ]
-      .filter(Boolean)
-      .join("\n");
+    const statusData: ProjectStatusData = {
+      project,
+      openTasks,
+      completedTasks,
+      recentNotes: recentNotes.slice(0, 10),
+      recentInboxEvents: recentInboxEvents.slice(0, 10),
+      escalationHistory,
+      narrativeSummary,
+    };
 
     await this.log("project_status_generated", projectId, {
-      openTasks: activeTasks.length,
-      notes: recentNotes.length,
+      openTaskCount: openTasks.length,
+      completedTaskCount: completedTasks.length,
+      noteCount: recentNotes.length,
+      escalationCount: escalationHistory.length,
     });
 
-    return report;
+    return statusData;
+  }
+
+  // -----------------------------------------------------------------------
+  // Format project status for Telegram
+  // -----------------------------------------------------------------------
+
+  /**
+   * Format a ProjectStatusData as a Telegram-compatible message with
+   * MarkdownV2 escaping (no emoji).
+   */
+  formatProjectStatus(data: ProjectStatusData): string {
+    const sections: string[] = [];
+
+    // Header
+    sections.push(
+      `PROJECT STATUS: ${escapeMarkdownV2(data.project.name)}`,
+    );
+    if (data.project.client) {
+      sections.push(`Client: ${escapeMarkdownV2(data.project.client)}`);
+    }
+    sections.push(
+      `Priority: P${data.project.priority} | Status: ${escapeMarkdownV2(data.project.status)}`,
+    );
+
+    // Narrative
+    sections.push("");
+    sections.push(escapeMarkdownV2(data.narrativeSummary));
+
+    // Tasks
+    sections.push("");
+    sections.push(
+      `TASKS: ${data.openTasks.length} open, ${data.completedTasks.length} completed`,
+    );
+    if (data.openTasks.length > 0) {
+      for (const task of data.openTasks.slice(0, 5)) {
+        const due = task.due_date
+          ? ` \\(due ${escapeMarkdownV2(task.due_date)}\\)`
+          : "";
+        sections.push(
+          `  \\- \\[P${task.priority}\\] ${escapeMarkdownV2(task.title)}${due}`,
+        );
+      }
+      if (data.openTasks.length > 5) {
+        sections.push(
+          `  \\.\\.\\. and ${data.openTasks.length - 5} more open tasks`,
+        );
+      }
+    }
+
+    // Recent notes
+    if (data.recentNotes.length > 0) {
+      sections.push("");
+      sections.push(`RECENT NOTES \\(${data.recentNotes.length}\\)`);
+      for (const note of data.recentNotes.slice(0, 3)) {
+        const snippet = (note.raw_text ?? "").slice(0, 100);
+        sections.push(`  \\- ${escapeMarkdownV2(snippet)}`);
+      }
+    }
+
+    // Inbox activity
+    if (data.recentInboxEvents.length > 0) {
+      sections.push("");
+      sections.push(
+        `RECENT INBOX \\(${data.recentInboxEvents.length}\\)`,
+      );
+      for (const evt of data.recentInboxEvents.slice(0, 3)) {
+        const label =
+          evt.subject ?? evt.body_summary ?? "no subject";
+        sections.push(
+          `  \\- \\[${escapeMarkdownV2(evt.channel)}\\] ${escapeMarkdownV2(label)}`,
+        );
+      }
+    }
+
+    // Escalations
+    if (data.escalationHistory.length > 0) {
+      sections.push("");
+      sections.push(
+        `ESCALATIONS \\(${data.escalationHistory.length}\\)`,
+      );
+      for (const esc of data.escalationHistory) {
+        sections.push(`  \\- ${escapeMarkdownV2(esc.summary)}`);
+      }
+    }
+
+    return sections.join("\n");
   }
 
   // -----------------------------------------------------------------------
@@ -326,7 +525,9 @@ Generate a brief status update.`,
             agent: this.name,
             message: formatted,
             data: {
+              date: data.date,
               pendingEscalations: data.pendingEscalations.length,
+              handledOvernight: data.handledOvernight.length,
               calendarEvents: data.calendarEvents.length,
               topPriorities: data.topPriorities,
               stats: data.stats,
@@ -335,12 +536,14 @@ Generate a brief status update.`,
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           logger.error("Briefing generation failed", { error: message });
+          await this.log("briefing_error", undefined, { error: message });
           return { status: "error", agent: this.name, message };
         }
       }
 
       case "project_status_request": {
-        const projectId = event.projectId ?? (event.data["projectId"] as string);
+        const projectId =
+          event.projectId ?? (event.data["projectId"] as string);
         if (!projectId) {
           return {
             status: "error",
@@ -349,15 +552,28 @@ Generate a brief status update.`,
           };
         }
         try {
-          const report = await this.generateProjectStatus(projectId);
+          const statusData = await this.generateProjectStatus(projectId);
+          const formatted = this.formatProjectStatus(statusData);
           return {
             status: "success",
             agent: this.name,
-            message: report,
+            message: formatted,
+            data: {
+              projectName: statusData.project.name,
+              openTasks: statusData.openTasks.length,
+              completedTasks: statusData.completedTasks.length,
+              recentNotes: statusData.recentNotes.length,
+              escalations: statusData.escalationHistory.length,
+            },
           };
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          logger.error("Project status generation failed", { error: message });
+          logger.error("Project status generation failed", {
+            error: message,
+          });
+          await this.log("project_status_error", projectId, {
+            error: message,
+          });
           return { status: "error", agent: this.name, message };
         }
       }
@@ -372,92 +588,171 @@ Generate a brief status update.`,
   }
 
   // -----------------------------------------------------------------------
-  // Helpers
+  // Private helpers
   // -----------------------------------------------------------------------
 
   /**
-   * Derive top 3 priorities by combining task urgency with project priority.
+   * Use Claude to derive the top 3 priorities from all aggregated data.
    */
-  private async computeTopPriorities(): Promise<
-    { title: string; project: string; dueDate: string | null }[]
-  > {
-    const openTasks = await tasksRepo.getOpen();
-    const projects = await projectsRepo.getActive();
-    const projectMap = new Map(projects.map((p) => [p.id, p]));
+  private async deriveTopPriorities(context: {
+    pendingEscalations: escalationsRepo.Escalation[];
+    openTasks: tasksRepo.Task[];
+    overdueTasks: tasksRepo.Task[];
+    calendarEvents: BriefingData["calendarEvents"];
+    handledOvernight: BriefingData["handledOvernight"];
+  }): Promise<string[]> {
+    try {
+      const escalationBlock =
+        context.pendingEscalations.length > 0
+          ? context.pendingEscalations
+              .map((e) => `- [${e.type ?? "general"}] ${e.summary}`)
+              .join("\n")
+          : "None";
 
-    // Score = task priority * project priority (lower is more urgent)
-    // Also boost overdue tasks
-    const scored = openTasks.map((task) => {
-      const project = task.project_id
-        ? projectMap.get(task.project_id)
-        : null;
-      const projectPriority = project?.priority ?? 5;
-      let score = task.priority * projectPriority;
+      const overdueBlock =
+        context.overdueTasks.length > 0
+          ? context.overdueTasks
+              .slice(0, 5)
+              .map(
+                (t) =>
+                  `- ${t.title} (P${t.priority}, due ${t.due_date})`,
+              )
+              .join("\n")
+          : "None";
 
-      // Boost overdue tasks
-      if (task.due_date) {
-        const dueDate = new Date(task.due_date);
-        const now = new Date();
-        if (dueDate < now) {
-          score = score * 0.5; // Overdue = double urgency
-        } else {
-          const daysUntilDue = (dueDate.getTime() - now.getTime()) / 86_400_000;
-          if (daysUntilDue <= 2) {
-            score = score * 0.7; // Due within 2 days
-          }
+      const topTasksBlock = context.openTasks
+        .slice(0, 10)
+        .map(
+          (t) =>
+            `- ${t.title} (P${t.priority}${t.due_date ? `, due ${t.due_date}` : ""})`,
+        )
+        .join("\n") || "None";
+
+      const calendarBlock =
+        context.calendarEvents.length > 0
+          ? context.calendarEvents
+              .map((e) => `- ${e.time}: ${e.summary}`)
+              .join("\n")
+          : "No meetings today";
+
+      const raw = await this.callClaude(
+        `You are Bryson Stevens' executive assistant. Based on today's data, identify the TOP 3 priorities Bryson should focus on today.
+
+Each priority should be a single, actionable sentence. Consider urgency (overdue/escalations), importance (project priority), and time-sensitivity (meetings today).
+
+Respond with valid JSON only (no markdown fences):
+["Priority 1 text", "Priority 2 text", "Priority 3 text"]`,
+        `PENDING ESCALATIONS:
+${escalationBlock}
+
+OVERDUE TASKS:
+${overdueBlock}
+
+TOP OPEN TASKS (by priority):
+${topTasksBlock}
+
+TODAY'S CALENDAR:
+${calendarBlock}
+
+OVERNIGHT ACTIONS (${context.handledOvernight.length} total):
+${context.handledOvernight.slice(0, 5).map((h) => `- ${h.summary}`).join("\n") || "None"}
+
+What are the top 3 priorities for today?`,
+        { maxTokens: 512 },
+      );
+
+      const cleaned = raw
+        .replace(/^```(?:json)?\n?/m, "")
+        .replace(/\n?```$/m, "")
+        .trim();
+      const parsed = JSON.parse(cleaned);
+
+      if (Array.isArray(parsed)) {
+        return parsed.slice(0, 3).map(String);
+      }
+
+      return [
+        "Review pending escalations",
+        "Address overdue tasks",
+        "Prepare for today's meetings",
+      ];
+    } catch (err) {
+      logger.error("Failed to derive top priorities via Claude", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Fallback: generate priorities heuristically
+      const priorities: string[] = [];
+
+      if (context.pendingEscalations.length > 0) {
+        priorities.push(
+          `Address ${context.pendingEscalations.length} pending escalation(s)`,
+        );
+      }
+      if (context.overdueTasks.length > 0) {
+        priorities.push(
+          `Resolve ${context.overdueTasks.length} overdue task(s)`,
+        );
+      }
+      if (context.calendarEvents.length > 0) {
+        priorities.push(
+          `Prepare for ${context.calendarEvents.length} meeting(s) today`,
+        );
+      }
+      if (context.openTasks.length > 0 && priorities.length < 3) {
+        const top = context.openTasks[0];
+        if (top) {
+          priorities.push(`Focus on: ${top.title}`);
         }
       }
 
-      return {
-        task,
-        project,
-        score,
-      };
-    });
-
-    scored.sort((a, b) => a.score - b.score);
-
-    return scored.slice(0, 3).map((s) => ({
-      title: s.task.title,
-      project: s.project?.name ?? "Unassigned",
-      dueDate: s.task.due_date,
-    }));
+      return priorities.slice(0, 3);
+    }
   }
 
-  private summarizeRecentInbox(
-    events: inboxEventsRepo.InboxEvent[],
-  ): string {
+  /**
+   * Summarize recent inbox events into a one-line string.
+   */
+  private summarizeInbox(events: inboxEventsRepo.InboxEvent[]): string {
     if (events.length === 0) return "No new inbox activity.";
 
-    const byChan: Record<string, number> = {};
+    const byChannel: Record<string, number> = {};
     let urgentCount = 0;
+
     for (const e of events) {
-      byChan[e.channel] = (byChan[e.channel] ?? 0) + 1;
-      if (e.intent === "urgent" || e.intent === "action_needed") {
+      byChannel[e.channel] = (byChannel[e.channel] ?? 0) + 1;
+      if (
+        e.intent === "urgent" ||
+        e.intent === "action_needed" ||
+        e.escalated
+      ) {
         urgentCount++;
       }
     }
 
-    const parts = Object.entries(byChan).map(
+    const parts = Object.entries(byChannel).map(
       ([chan, count]) => `${count} ${chan}`,
     );
     const urgentNote =
       urgentCount > 0 ? ` (${urgentCount} need attention)` : "";
     return `${parts.join(", ")}${urgentNote}`;
   }
-
-  private async getNotesCreatedSince(since: Date): Promise<notesRepo.Note[]> {
-    // The notes repo doesn't have a "since" filter, so we get all and filter.
-    // In production, you'd add a proper query. For now, get recent and filter.
-    const allNotes = await notesRepo.getAll();
-    return allNotes.filter((n) => new Date(n.created_at) >= since);
-  }
 }
 
 // ---------------------------------------------------------------------------
-// Utility
+// Telegram MarkdownV2 escaping
 // ---------------------------------------------------------------------------
 
+/**
+ * Escape special characters for Telegram MarkdownV2 format.
+ * Characters that need escaping: _ * [ ] ( ) ~ ` > # + - = | { } . !
+ */
+function escapeMarkdownV2(text: string): string {
+  return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
+}
+
+/**
+ * Format an ISO datetime string as a human-readable time (e.g. "9:30 AM").
+ */
 function formatTime(isoString: string): string {
   try {
     const date = new Date(isoString);
@@ -470,3 +765,9 @@ function formatTime(isoString: string): string {
     return isoString;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Singleton
+// ---------------------------------------------------------------------------
+
+export const reportingAgent = new ReportingAgent();

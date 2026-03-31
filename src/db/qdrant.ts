@@ -15,14 +15,12 @@ export type CollectionName = (typeof COLLECTIONS)[number];
 /** OpenClaw's primary Qdrant instance. */
 export const qdrant = new QdrantClient({
   url: config.qdrant.url,
-  apiKey: config.qdrant.apiKey,
 });
 
-/** SWRE's Qdrant instance (read-only access). */
-export const qdrantSwre = new QdrantClient({
-  url: config.qdrantSwre.url,
-  apiKey: config.qdrantSwre.apiKey,
-});
+/** SWRE's Qdrant instance (read-only access). Returns null if not configured. */
+export const qdrantSwre = config.qdrant.swreUrl
+  ? new QdrantClient({ url: config.qdrant.swreUrl })
+  : null;
 
 /**
  * Initialize all required collections if they don't already exist.

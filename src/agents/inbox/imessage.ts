@@ -29,7 +29,7 @@ interface ConversationResult {
 // ---------------------------------------------------------------------------
 
 const BRIDGE_BASE_URL =
-  process.env["IMESSAGE_BRIDGE_URL"] ?? "http://localhost:3001";
+  config.imessage.bridgeUrl ?? "http://localhost:3001";
 
 // ---------------------------------------------------------------------------
 // iMessage Sub-Agent

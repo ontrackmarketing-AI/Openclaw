@@ -1,5 +1,4 @@
 import { BaseAgent, AgentEvent, AgentResult } from "../base.js";
-import { config } from "../../config/index.js";
 import { logger } from "../../config/logger.js";
 import { redis } from "../../db/redis.js";
 import * as projectsRepo from "../../db/repositories/projects.js";
